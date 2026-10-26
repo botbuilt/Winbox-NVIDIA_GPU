@@ -26,7 +26,7 @@ jobs:
   build:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: src
 
@@ -137,7 +137,7 @@ jobs:
           Get-ChildItem $out -Recurse | Select-Object FullName, Length
           "PACKAGE=$out" >> $env:GITHUB_ENV
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.PACKAGE }}
           path: ${{ env.PACKAGE }}.zip
