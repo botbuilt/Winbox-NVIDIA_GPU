@@ -1,0 +1,25 @@
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index edd2c1c..456b703 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -1749,6 +1749,7 @@ static const Property virtio_gpu_properties[] = {
+     DEFINE_PROP_BIT("blob", VirtIOGPU, parent_obj.conf.flags,
+                     VIRTIO_GPU_FLAG_BLOB_ENABLED, false),
+     DEFINE_PROP_SIZE("hostmem", VirtIOGPU, parent_obj.conf.hostmem, 0),
++    DEFINE_PROP_SIZE("host3d_blob_limit", VirtIOGPU, winbox_host3d_blob_limit, 0),
+     DEFINE_PROP_UINT8("x-scanout-vmstate-version", VirtIOGPU, scanout_vmstate_version, 2),
+ };
+ 
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index de53f96..b0e11a5 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -216,6 +216,8 @@ struct VirtIOGPU {
+ 
+     uint8_t scanout_vmstate_version;
+     uint64_t conf_max_hostmem;
++    /* WinBox: accepted for Helios command-line compatibility, unused. */
++    uint64_t winbox_host3d_blob_limit;
+ 
+     VirtQueue *ctrl_vq;
+     VirtQueue *cursor_vq;

@@ -1,0 +1,101 @@
+diff --git a/src/neptune/neptune-protocol/npt_protocol_host_id3d11device.h b/src/neptune/neptune-protocol/npt_protocol_host_id3d11device.h
+index 94f0efd..8df4685 100644
+--- a/src/neptune/neptune-protocol/npt_protocol_host_id3d11device.h
++++ b/src/neptune/neptune-protocol/npt_protocol_host_id3d11device.h
+@@ -17,6 +17,24 @@
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ #pragma GCC diagnostic ignored "-Wpointer-arith"
+ 
++/* WinBox: 32-bit (WoW64) guest apps send SIZE_T bytecode lengths with
++ * garbage in the upper half; no D3D11 bytecode is 4 GiB, so keep the low
++ * half. */
++static inline void
++npt_decode_SIZE_T_wow64(struct npt_cs_decoder *dec, SIZE_T *val)
++{
++    npt_decode_SIZE_T(dec, val);
++    if ((uint64_t)*val >> 32) {
++        static bool logged;
++        if (!logged) {
++            logged = true;
++            npt_log("32-bit guest SIZE_T 0x%016" PRIx64 ", using its low half",
++                    (uint64_t)*val);
++        }
++        *val = (SIZE_T)((uint64_t)*val & 0xffffffffu);
++    }
++}
++
+ /*
+  * ID3D11Device::CreateBuffer
+  */
+@@ -1362,7 +1380,7 @@ npt_decode_ID3D11Device_CreateInputLayout_args_temp(struct npt_cs_decoder *dec,
+     } else {
+         args->pShaderBytecodeWithInputSignature = NULL;
+     }
+-    npt_decode_SIZE_T(dec, &args->BytecodeLength);
++    npt_decode_SIZE_T_wow64(dec, &args->BytecodeLength);
+     {
+         uint64_t _gid;
+         npt_decode_uint64_t(dec, &_gid);
+@@ -1539,7 +1557,7 @@ npt_decode_ID3D11Device_CreateVertexShader_args_temp(struct npt_cs_decoder *dec,
+     } else {
+         args->pShaderBytecode = NULL;
+     }
+-    npt_decode_SIZE_T(dec, &args->BytecodeLength);
++    npt_decode_SIZE_T_wow64(dec, &args->BytecodeLength);
+     {
+         npt_object_id _id;
+         npt_decode_uint64_t(dec, &_id);
+@@ -1708,7 +1726,7 @@ npt_decode_ID3D11Device_CreateGeometryShader_args_temp(struct npt_cs_decoder *de
+     } else {
+         args->pShaderBytecode = NULL;
+     }
+-    npt_decode_SIZE_T(dec, &args->BytecodeLength);
++    npt_decode_SIZE_T_wow64(dec, &args->BytecodeLength);
+     {
+         npt_object_id _id;
+         npt_decode_uint64_t(dec, &_id);
+@@ -1884,7 +1902,7 @@ npt_decode_ID3D11Device_CreateGeometryShaderWithStreamOutput_args_temp(struct np
+     } else {
+         args->pShaderBytecode = NULL;
+     }
+-    npt_decode_SIZE_T(dec, &args->BytecodeLength);
++    npt_decode_SIZE_T_wow64(dec, &args->BytecodeLength);
+     _has_cnt_pSODeclaration = 0;
+     if (npt_decode_counted_pointer_count(dec, &_cnt_pSODeclaration)) {
+         _has_cnt_pSODeclaration = 1;
+@@ -2088,7 +2106,7 @@ npt_decode_ID3D11Device_CreatePixelShader_args_temp(struct npt_cs_decoder *dec,
+     } else {
+         args->pShaderBytecode = NULL;
+     }
+-    npt_decode_SIZE_T(dec, &args->BytecodeLength);
++    npt_decode_SIZE_T_wow64(dec, &args->BytecodeLength);
+     {
+         npt_object_id _id;
+         npt_decode_uint64_t(dec, &_id);
+@@ -2257,7 +2275,7 @@ npt_decode_ID3D11Device_CreateHullShader_args_temp(struct npt_cs_decoder *dec,
+     } else {
+         args->pShaderBytecode = NULL;
+     }
+-    npt_decode_SIZE_T(dec, &args->BytecodeLength);
++    npt_decode_SIZE_T_wow64(dec, &args->BytecodeLength);
+     {
+         npt_object_id _id;
+         npt_decode_uint64_t(dec, &_id);
+@@ -2426,7 +2444,7 @@ npt_decode_ID3D11Device_CreateDomainShader_args_temp(struct npt_cs_decoder *dec,
+     } else {
+         args->pShaderBytecode = NULL;
+     }
+-    npt_decode_SIZE_T(dec, &args->BytecodeLength);
++    npt_decode_SIZE_T_wow64(dec, &args->BytecodeLength);
+     {
+         npt_object_id _id;
+         npt_decode_uint64_t(dec, &_id);
+@@ -2595,7 +2613,7 @@ npt_decode_ID3D11Device_CreateComputeShader_args_temp(struct npt_cs_decoder *dec
+     } else {
+         args->pShaderBytecode = NULL;
+     }
+-    npt_decode_SIZE_T(dec, &args->BytecodeLength);
++    npt_decode_SIZE_T_wow64(dec, &args->BytecodeLength);
+     {
+         npt_object_id _id;
+         npt_decode_uint64_t(dec, &_id);

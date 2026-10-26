@@ -1,0 +1,151 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # ghcr needs a lowercase owner; set again per job from github.repository_owner.
+  IMAGE_NAME: winbox-triton
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Shellcheck
+        run: shellcheck src/*.sh scripts/*.sh tests/*.sh
+      - name: Hook tests
+        run: bash tests/test_start.sh
+      - name: Healthcheck tests
+        run: bash tests/test_health.sh
+      - name: User Scripts tests
+        run: bash tests/test_scripts.sh
+      - name: Validate Unraid template
+        run: sudo apt-get install -y libxml2-utils && xmllint --noout unraid/winbox.xml
+
+  # Boots the real image under KVM. ReactOS is used because it is a 100 MB
+  # download through the same upstream download/boot path as Windows.
+  boot-test:
+    needs: test
+    runs-on: ubuntu-latest
+    # The first build compiles QEMU, virglrenderer and DXVK (about 1-2 hours);
+    # later builds reuse the GitHub Actions cache.
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: winbox:ci
+          cache-from: type=gha,scope=winbox
+          cache-to: type=gha,mode=max,scope=winbox
+      - name: Refuses a default password
+        run: |
+          set +e
+          docker run --rm winbox:ci > out.txt 2>&1
+          rc=$?
+          cat out.txt
+          [ "$rc" -eq 88 ] && grep -q "well-known default" out.txt
+      - name: Boot under KVM
+        run: |
+          docker run -d --name boot \
+            --device /dev/kvm --device /dev/net/tun --cap-add NET_ADMIN \
+            -e VERSION=reactos -e PASSWORD=ci-Test-1234 -e RAM_SIZE=2G -e CPU_CORES=2 \
+            winbox:ci
+          for _ in $(seq 1 120); do
+            docker logs boot 2>&1 | grep -q "using QEMU v" && break
+            [ "$(docker inspect -f '{{.State.Running}}' boot)" = "true" ] || break
+            sleep 5
+          done
+          sleep 60
+          docker logs boot 2>&1 | tail -40
+          docker logs boot 2>&1 | grep -q "using QEMU v"
+          docker exec boot pgrep -f qemu-system-x86_64
+          docker exec boot /run/health.sh
+      - name: Clean shutdown
+        run: |
+          start=$(date +%s)
+          docker stop -t 120 boot
+          echo "Stopped after $(( $(date +%s) - start ))s"
+          docker logs boot 2>&1 | tail -10
+          [ "$(docker inspect -f '{{.State.ExitCode}}' boot)" -ne 137 ]
+
+  publish:
+    needs: [test, boot-test]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      packages: write
+      id-token: write            # keyless cosign signing
+      security-events: write     # Trivy results in the Security tab
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=edge,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=sha
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=winbox
+          cache-to: type=gha,mode=max,scope=winbox
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign image
+        run: cosign sign --yes "${IMAGE}@${{ steps.build.outputs.digest }}"
+      - name: Scan image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          # Most findings come from the upstream base image; report them in
+          # the Security tab instead of blocking the release.
+          exit-code: "0"
+      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        if: always()
+        # Needs code scanning, which private repos only get with GitHub
+        # Advanced Security; don't fail the release over it.
+        continue-on-error: true
+        with:
+          sarif_file: trivy.sarif

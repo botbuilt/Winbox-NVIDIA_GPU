@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # dockurr/windows base image (tag + digest in the Dockerfile)
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+
+  # GitHub Actions, pinned by commit SHA in the workflows
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"

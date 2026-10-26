@@ -1,0 +1,75 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>WinBox</Name>
+  <Repository>ghcr.io/botbuilt/winbox-triton:latest</Repository>
+  <Registry>https://github.com/botbuilt/Winbox-triton-driver/pkgs/container/winbox-triton</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/botbuilt/Winbox-triton-driver/issues</Support>
+  <Project>https://github.com/botbuilt/Winbox-triton-driver</Project>
+  <Overview>Windows 10/11 (or Server) running in a QEMU/KVM virtual machine inside a container. Installs itself automatically on first start; watch progress in the WebUI. Supports persistent storage on your array or cache, an Unraid share mapped as drive Z:, DirectX 11 on a GPU that stays shared with Unraid and other containers, through the experimental Triton driver (tested on Nvidia), optional dedicated VFIO passthrough, and USB passthrough. Defaults are set up for a shared Nvidia GPU; see the project README for setup.</Overview>
+  <Category>Tools: Productivity:</Category>
+  <WebUI>http://[IP]:[PORT:8006]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/botbuilt/Winbox-triton-driver/main/unraid/winbox.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/dockur/windows/master/.github/logo.png</Icon>
+  <ExtraParams>--runtime=nvidia --device=/dev/dri --cap-add=NET_ADMIN --stop-timeout=120 --memory=16g --memory-swap=16g -v /usr/lib64/libnvidia-allocator.so.1:/run/nvidia-host/libnvidia-allocator.so.1:ro -v /usr/lib64/libnvidia-egl-gbm.so.1:/run/nvidia-host/libnvidia-egl-gbm.so.1:ro</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <Requires>Hardware virtualization (Intel VT-x or AMD-V) enabled in the BIOS. Unraid 7.3 or newer. For DirectX on a shared Nvidia card: the Nvidia Driver plugin with modesetting on, and the Triton driver inside Windows (see README). --memory in Extra Parameters caps the whole container; keep it about 8G above RAM. Without an Nvidia GPU, remove --runtime=nvidia and the two /usr/lib64 mounts from Extra Parameters.</Requires>
+
+  <!-- Ports -->
+  <Config Name="Web console" Target="8006" Default="8006" Mode="tcp" Description="Browser console, used to watch the installation." Type="Port" Display="always" Required="true" Mask="false">8006</Config>
+  <Config Name="RDP (TCP)" Target="3389" Default="3389" Mode="tcp" Description="Remote Desktop. Sign in with the username and password below." Type="Port" Display="always" Required="true" Mask="false">3389</Config>
+  <Config Name="RDP (UDP)" Target="3389" Default="3389" Mode="udp" Description="Remote Desktop over UDP, smoother video." Type="Port" Display="advanced" Required="false" Mask="false">3389</Config>
+
+  <!-- Storage -->
+  <Config Name="Windows storage" Target="/storage" Default="/mnt/cache/domains/windows" Mode="rw" Description="Holds the Windows system disk image. Use the pool path (/mnt/cache/... or /mnt/&lt;pool&gt;/...), not /mnt/user/..., which adds a slow FUSE layer." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/domains/windows</Config>
+  <Config Name="Shared folder (Z:)" Target="/shared" Default="/mnt/user/windows-share" Mode="rw" Description="An Unraid share that shows up in Windows as the 'Shared' desktop folder and drive Z:." Type="Path" Display="always" Required="false" Mask="false">/mnt/user/windows-share</Config>
+  <Config Name="Second disk storage" Target="/storage2" Default="" Mode="rw" Description="Optional. Folder for a second virtual disk, used together with 'Second disk size'." Type="Path" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Second disk size" Target="DISK2_SIZE" Default="" Mode="" Description="Optional. Size of a second virtual disk, for example 500G. Needs 'Second disk storage'." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Custom ISO" Target="/custom.iso" Default="" Mode="ro" Description="Optional. Path to your own Windows ISO. When set, VERSION is ignored." Type="Path" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Unraid Docker settings" Target="/run/unraid/docker.cfg" Default="/boot/config/docker.cfg" Mode="ro" Description="Read-only. Lets WinBox check that Unraid's Docker Stop Timeout is long enough for Windows to shut down cleanly, and warn in the log if not." Type="Path" Display="advanced" Required="false" Mask="false">/boot/config/docker.cfg</Config>
+  <Config Name="OEM folder" Target="/oem" Default="" Mode="ro" Description="Optional. Folder copied to C:\OEM; an install.bat inside it runs at the end of setup (good for drivers like the GPU driver)." Type="Path" Display="advanced" Required="false" Mask="false"/>
+
+  <!-- Windows -->
+  <Config Name="Windows version" Target="VERSION" Default="11|10|11l|10l|11e|10e|2025|2022|2019|tiny11" Mode="" Description="11 = Windows 11 Pro, 10 = Windows 10 Pro, 11l/10l = LTSC, 11e/10e = Enterprise, 2025/2022/2019 = Server." Type="Variable" Display="always" Required="true" Mask="false">11</Config>
+  <Config Name="Username" Target="USERNAME" Default="Docker" Mode="" Description="Windows account created during installation." Type="Variable" Display="always" Required="true" Mask="false">Docker</Config>
+  <Config Name="Password" Target="PASSWORD" Default="" Mode="" Description="Required. Password for the Windows account and the web console. Defaults like admin are refused." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Protect web console" Target="PROTECT" Default="Y|N" Mode="" Description="Y = the web console on port 8006 asks for the username and password above." Type="Variable" Display="advanced" Required="false" Mask="false">Y</Config>
+  <Config Name="Language" Target="LANGUAGE" Default="English" Mode="" Description="Windows language, for example English, German, French." Type="Variable" Display="advanced" Required="false" Mask="false">English</Config>
+  <Config Name="Product key" Target="KEY" Default="" Mode="" Description="Optional. Your Windows product key." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+
+  <!-- Resources -->
+  <Config Name="RAM" Target="RAM_SIZE" Default="8G" Mode="" Description="Memory for Windows, for example 8G or 16G. Keep the --memory cap in Extra Parameters about 8G higher: the GPU memory window and the per-app GPU helpers live outside this." Type="Variable" Display="always" Required="true" Mask="false">8G</Config>
+  <Config Name="CPU cores" Target="CPU_CORES" Default="4" Mode="" Description="Number of virtual CPU cores. Use the CPU Pinning setting below to keep Windows off the cores Unraid uses." Type="Variable" Display="always" Required="true" Mask="false">4</Config>
+  <Config Name="System disk size" Target="DISK_SIZE" Default="128G" Mode="" Description="Size of the Windows system disk. Can be increased later (then extend C: in Disk Management)." Type="Variable" Display="always" Required="true" Mask="false">128G</Config>
+
+  <!-- Required devices -->
+  <Config Name="KVM" Target="/dev/kvm" Default="/dev/kvm" Mode="" Description="Hardware virtualization. Required." Type="Device" Display="advanced-hide" Required="true" Mask="false">/dev/kvm</Config>
+  <Config Name="TUN" Target="/dev/net/tun" Default="/dev/net/tun" Mode="" Description="Networking for the VM. Required." Type="Device" Display="advanced-hide" Required="true" Mask="false">/dev/net/tun</Config>
+
+  <!-- Shared GPU (stays usable by Unraid and other containers) -->
+  <Config Name="GPU acceleration" Target="GPU" Default="Y|N" Mode="" Description="Y = 3D acceleration on a GPU that Unraid and other containers keep using. Needs --runtime=nvidia (Nvidia) and --device=/dev/dri in Extra Parameters, and the Nvidia Driver plugin." Type="Variable" Display="always" Required="false" Mask="false">Y</Config>
+  <Config Name="Virtual GPU type" Target="VGA" Default="virtio-vga-gl,neptune=true|virtio" Mode="" Description="virtio-vga-gl,neptune=true = Triton: Windows DirectX 11 runs on your GPU (needs the Triton driver in Windows, see README). virtio = display only. Without GPU acceleration a plain virtio display is used automatically." Type="Variable" Display="advanced" Required="false" Mask="false">virtio-vga-gl,neptune=true</Config>
+  <Config Name="Nvidia GPU UUID" Target="NVIDIA_VISIBLE_DEVICES" Default="" Mode="" Description="UUID of the Nvidia GPU from Plugins &gt; Nvidia Driver (starts with GPU-), or 'all'. The same GPU can be given to Plex, Jellyfin and others." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Nvidia capabilities" Target="NVIDIA_DRIVER_CAPABILITIES" Default="all" Mode="" Description="Must include graphics and display. Leave at 'all'." Type="Variable" Display="advanced" Required="false" Mask="false">all</Config>
+  <Config Name="GPU memory budget" Target="VRAM_SIZE" Default="4G" Mode="" Description="Video memory Windows may use on the shared GPU, as a power of two (2G, 4G, 8G). Leave room for the other containers." Type="Variable" Display="advanced" Required="false" Mask="false">4G</Config>
+  <Config Name="Render node" Target="RENDERNODE" Default="" Mode="" Description="Optional. Picked automatically, preferring the Nvidia card. Set it, for example /dev/dri/renderD128, to choose a specific GPU." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <!-- Alternative: dedicated passthrough (VFIO). Takes the GPU away from Unraid; set GPU=N when using it. -->
+  <Config Name="GPU passthrough" Target="GPU_PASSTHROUGH" Default="" Mode="" Description="Alternative to shared mode: the GPU is taken away from Unraid and every other container while Windows runs. Set GPU acceleration to N. PCI address from Tools &gt; System Devices, for example 01:00.0. The GPU's audio function is added automatically. Bind it to VFIO first, then add --device=/dev/vfio/vfio --device=/dev/vfio/N (N = its IOMMU group) to Extra Parameters." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="GPU is primary display" Target="GPU_PRIMARY" Default="N|Y" Mode="" Description="Y = Windows uses only the passed-through GPU (plug a monitor or dummy plug into it). Turns off the web console; use RDP, Parsec or Sunshine. N = keep the web console as a second display." Type="Variable" Display="advanced" Required="false" Mask="false">N</Config>
+  <Config Name="GPU vBIOS ROM" Target="GPU_ROM" Default="" Mode="" Description="Optional. Path inside the container to a vBIOS ROM file. Only needed for cards that fail to start, usually the GPU Unraid booted from. Map the file with 'GPU ROM file' below and enter /roms/gpu.rom here." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="GPU ROM file" Target="/roms/gpu.rom" Default="" Mode="ro" Description="Optional. The vBIOS file on Unraid, for example /mnt/user/isos/vbios/gpu.rom." Type="Path" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Other PCI passthrough" Target="PCI_PASSTHROUGH" Default="" Mode="" Description="Optional. More vfio-bound PCI devices, comma separated, for example a USB controller 03:00.0 or an NVMe drive. Add --device=/dev/vfio/N for each extra IOMMU group." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Pass whole IOMMU group" Target="VFIO_GROUP" Default="Y|N" Mode="" Description="Y = automatically add the other devices that share an IOMMU group with the ones you listed (bridges excluded). VFIO needs the whole group." Type="Variable" Display="advanced" Required="false" Mask="false">Y</Config>
+
+  <!-- USB -->
+  <Config Name="USB passthrough" Target="USB_PASSTHROUGH" Default="" Mode="" Description="Optional. USB devices as vendor:product, comma separated, for example 046d:c52b (run 'lsusb' on the Unraid terminal). Add --device=/dev/bus/usb to Extra Parameters. Connect USB drives only after Windows is installed." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <!-- Extras -->
+  <Config Name="Audio in web console" Target="AUDIO" Default="N|Y" Mode="" Description="Stream Windows audio to the web console." Type="Variable" Display="advanced" Required="false" Mask="false">N</Config>
+  <Config Name="Extra QEMU arguments" Target="ARGUMENTS" Default="" Mode="" Description="Optional raw QEMU arguments, for experts." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+</Container>

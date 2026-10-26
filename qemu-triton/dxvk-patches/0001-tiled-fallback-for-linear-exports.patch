@@ -1,0 +1,70 @@
+diff --git a/src/dxvk/dxvk_image.cpp b/src/dxvk/dxvk_image.cpp
+index 7fd7de71..654f4f2d 100644
+--- a/src/dxvk/dxvk_image.cpp
++++ b/src/dxvk/dxvk_image.cpp
+@@ -834,7 +834,21 @@ namespace dxvk {
+     if (createInfo.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+       requiredFormatFeatures |= VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+ 
++    // WinBox: some drivers (NVIDIA) expose no shareable LINEAR modifier for
++    // scanout formats. Rather than failing the export, retry with the
++    // driver's tiled modifiers; the exported descriptor carries the
++    // modifier, so a modifier-aware consumer can still import it.
++    bool allowTiledFallback = false;
++
++  retryModifiers:
+     for (const auto& props : modifierProperties) {
++      if (props.drmFormatModifier == 0u && sharingInfo.dmabufForceLinear && !allowTiledFallback) {
++        Logger::info(str::format("Linear modifier for format ", createInfo.format,
++          ": features 0x", std::hex, props.drmFormatModifierTilingFeatures,
++          ", required 0x", requiredFormatFeatures, ", usage 0x", createInfo.usage,
++          ", flags 0x", createInfo.flags, std::dec));
++      }
++
+       if ((props.drmFormatModifierTilingFeatures & requiredFormatFeatures) != requiredFormatFeatures)
+         continue;
+ 
+@@ -845,7 +859,7 @@ namespace dxvk {
+       // Linear-forced exports (scanout consumers without modifier
+       // plumbing) accept only DRM_FORMAT_MOD_LINEAR.
+       if (sharingInfo.mode == DxvkSharedHandleMode::Export
+-       && sharingInfo.dmabufForceLinear
++       && sharingInfo.dmabufForceLinear && !allowTiledFallback
+        && props.drmFormatModifier != 0u)
+         continue;
+ 
+@@ -867,8 +881,16 @@ namespace dxvk {
+       VkExternalImageFormatProperties externalProperties = { VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+       VkImageFormatProperties2 imageFormatProperties = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &externalProperties };
+ 
+-      if (vki->vkGetPhysicalDeviceImageFormatProperties2(device->adapter()->handle(),
+-          &imageFormatInfo, &imageFormatProperties) != VK_SUCCESS)
++      VkResult formatResult = vki->vkGetPhysicalDeviceImageFormatProperties2(
++        device->adapter()->handle(), &imageFormatInfo, &imageFormatProperties);
++
++      if (props.drmFormatModifier == 0u && sharingInfo.dmabufForceLinear && !allowTiledFallback) {
++        Logger::info(str::format("Linear modifier image query: ", int32_t(formatResult),
++          ", external features 0x", std::hex,
++          externalProperties.externalMemoryProperties.externalMemoryFeatures, std::dec));
++      }
++
++      if (formatResult != VK_SUCCESS)
+         continue;
+ 
+       const auto& limits = imageFormatProperties.imageFormatProperties;
+@@ -884,6 +906,15 @@ namespace dxvk {
+       m_dmabufModifiers.push_back({ props.drmFormatModifier, props.drmFormatModifierPlaneCount });
+     }
+ 
++    if (m_dmabufModifiers.empty()
++     && sharingInfo.mode == DxvkSharedHandleMode::Export
++     && sharingInfo.dmabufForceLinear && !allowTiledFallback) {
++      Logger::warn(str::format("No shareable linear modifier for format ",
++        createInfo.format, ", exporting with a tiled modifier instead"));
++      allowTiledFallback = true;
++      goto retryModifiers;
++    }
++
+     if (m_dmabufModifiers.empty()) {
+       Logger::err(str::format("Failed to create dmabuf-shared resource: no usable modifier for format ",
+         createInfo.format));

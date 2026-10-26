@@ -1,0 +1,44 @@
+# Example for Unraid (Compose Manager plugin) or any Linux host with KVM.
+# Set up for a shared Nvidia GPU with Triton; paths follow Unraid conventions.
+services:
+  winbox:
+    image: ghcr.io/botbuilt/winbox-triton:latest
+    build: .
+    container_name: WinBox             # the User Scripts expect this name
+    runtime: nvidia                         # remove for Intel/AMD or no GPU
+    environment:
+      VERSION: "11"                         # 11, 10, 11l (LTSC), 2025, ... see README
+      RAM_SIZE: "8G"
+      CPU_CORES: "4"
+      DISK_SIZE: "128G"
+      USERNAME: "windows"
+      PASSWORD: ""                          # required; defaults like admin are refused
+      # Shared GPU: Unraid and other containers keep using it.
+      GPU: "Y"
+      VGA: "virtio-vga-gl,neptune=true"      # Triton: DirectX 11 on the GPU (driver needed in Windows)
+      NVIDIA_VISIBLE_DEVICES: "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # Plugins > Nvidia Driver
+      NVIDIA_DRIVER_CAPABILITIES: "all"
+      VRAM_SIZE: "4G"
+      # USB_PASSTHROUGH: "046d:c52b"
+    devices:
+      - /dev/kvm
+      - /dev/net/tun
+      - /dev/dri
+      # - /dev/bus/usb                      # with USB_PASSTHROUGH
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - 8006:8006                           # web console
+      - 3389:3389/tcp                       # RDP
+      - 3389:3389/udp
+    volumes:
+      - /mnt/cache/domains/windows:/storage # Windows system disk (pool path, not /mnt/user)
+      - /mnt/user/windows-share:/shared     # appears as Z: in Windows
+      # - /mnt/cache/domains/windows-data:/storage2   # with DISK2_SIZE
+      # Nvidia GBM driver, which the Nvidia runtime does not add (remove for Intel/AMD):
+      - /usr/lib64/libnvidia-allocator.so.1:/run/nvidia-host/libnvidia-allocator.so.1:ro
+      - /usr/lib64/libnvidia-egl-gbm.so.1:/run/nvidia-host/libnvidia-egl-gbm.so.1:ro
+    mem_limit: 16g                          # whole container; keep ~8G above RAM_SIZE
+    memswap_limit: 16g
+    restart: unless-stopped
+    stop_grace_period: 2m

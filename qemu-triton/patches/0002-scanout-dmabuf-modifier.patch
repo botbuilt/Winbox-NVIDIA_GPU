@@ -1,0 +1,43 @@
+diff --git a/hw/display/virtio-gpu-udmabuf.c b/hw/display/virtio-gpu-udmabuf.c
+index b4724da..da65511 100644
+--- a/hw/display/virtio-gpu-udmabuf.c
++++ b/hw/display/virtio-gpu-udmabuf.c
+@@ -186,7 +186,8 @@ static VGPUDMABuf
+     dmabuf->buf = qemu_dmabuf_new(r->width, r->height, fb->stride,
+                                   r->x, r->y, fb->width, fb->height,
+                                   qemu_pixman_to_drm_format(fb->format),
+-                                  0, res->dmabuf_fd, true, false);
++                                  res->dmabuf_modifier, res->dmabuf_fd,
++                                  true, false);
+     dmabuf->scanout_id = scanout_id;
+     /* Remember the request identity so a later identical present can reuse
+      * this dmabuf + its EGL import instead of re-creating it. */
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index a57f9e0..ddb3b1a 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -1014,6 +1014,11 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
+     }
+ 
+     res->base.dmabuf_fd = info.fd;
++    /* WinBox: Neptune scanouts on NVIDIA are tiled, never linear. */
++    if (virgl_renderer_resource_get_modifier(cblob.resource_id,
++                                             &res->base.dmabuf_modifier)) {
++        res->base.dmabuf_modifier = 0;
++    }
+ 
+     /* Now live, cleaned up in virtio_gpu_virgl_resource_unref */
+     QTAILQ_INSERT_HEAD(&g->reslist, &res->base, next);
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index de53f96..ec94114 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -58,6 +58,8 @@ struct virtio_gpu_simple_resource {
+     uint64_t blob_size;
+     void *blob;
+     int dmabuf_fd;
++    /* WinBox: DRM format modifier of dmabuf_fd, 0 (linear) if unknown. */
++    uint64_t dmabuf_modifier;
+     uint8_t *remapped;
+ 
+     QTAILQ_ENTRY(virtio_gpu_simple_resource) next;

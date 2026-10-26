@@ -1,0 +1,15 @@
+diff --git a/src/dxgi/dxgi_format.cpp b/src/dxgi/dxgi_format.cpp
+index 527c1d7e..86076440 100644
+--- a/src/dxgi/dxgi_format.cpp
++++ b/src/dxgi/dxgi_format.cpp
+@@ -871,7 +871,9 @@ namespace dxvk {
+       RemapDepthFormat(DXGI_FORMAT_D24_UNORM_S8_UINT,     VK_FORMAT_D32_SFLOAT_S8_UINT);
+     }
+ 
+-    if (!CheckImageFormatSupport(device, VK_FORMAT_A8_UNORM_KHR,
++    // Neptune shares guest textures as dmabufs, and A8 has no DRM format,
++    // so drivers offer no modifier for it. R8 with a swizzle exports fine.
++    if (true || !CheckImageFormatSupport(device, VK_FORMAT_A8_UNORM_KHR,
+           VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+           VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+           VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {

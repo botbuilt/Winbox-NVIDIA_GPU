@@ -1,0 +1,80 @@
+diff --git a/src/virtio/neptune/npt_renderer_virtgpu_win32.c b/src/virtio/neptune/npt_renderer_virtgpu_win32.c
+index 8fe5d5d..31716a6 100644
+--- a/src/virtio/neptune/npt_renderer_virtgpu_win32.c
++++ b/src/virtio/neptune/npt_renderer_virtgpu_win32.c
+@@ -15,6 +15,7 @@
+ /* WIN32_NO_STATUS keeps windows.h from defining a subset of STATUS_*
+  * codes; we get the full set from ntstatus.h below. */
+ #define WIN32_NO_STATUS
++#include <stdlib.h>
+ #include <windows.h>
+ #undef WIN32_NO_STATUS
+ 
+@@ -1065,6 +1066,58 @@ virtgpu_load_d3dkmt(struct npt_virtgpu *gpu)
+    return true;
+ }
+ 
++/* Fallback for sessions where the viogpu adapter has no display device,
++ * e.g. a Remote Desktop session: EnumDisplayDevices then lists only the
++ * RDP adapter, so find viogpu among all WDDM adapters by PCI id. */
++static bool
++virtgpu_find_adapter_kmt(struct npt_virtgpu *gpu)
++{
++   PFND3DKMT_ENUMADAPTERS2 enum_adapters2 =
++      (PFND3DKMT_ENUMADAPTERS2)GetProcAddress(gpu->gdi32,
++                                              "D3DKMTEnumAdapters2");
++   if (!enum_adapters2)
++      return false;
++
++   D3DKMT_ENUMADAPTERS2 e = { 0 };
++   if (!NT_SUCCESS(enum_adapters2(&e)) || !e.NumAdapters)
++      return false;
++   D3DKMT_ADAPTERINFO *adapters = calloc(e.NumAdapters, sizeof(*adapters));
++   if (!adapters)
++      return false;
++   e.pAdapters = adapters;
++   if (!NT_SUCCESS(enum_adapters2(&e))) {
++      free(adapters);
++      return false;
++   }
++
++   bool found = false;
++   for (ULONG i = 0; i < e.NumAdapters; i++) {
++      if (!found) {
++         D3DKMT_QUERY_DEVICE_IDS ids = { 0 };
++         D3DKMT_QUERYADAPTERINFO query = {
++            .hAdapter = adapters[i].hAdapter,
++            .Type = KMTQAITYPE_PHYSICALADAPTERDEVICEIDS,
++            .pPrivateDriverData = &ids,
++            .PrivateDriverDataSize = sizeof(ids),
++         };
++         if (NT_SUCCESS(gpu->cb.queryAdapterInfo(&query)) &&
++             ids.DeviceIds.VendorID == 0x1AF4 &&
++             ids.DeviceIds.DeviceID == 0x1050) {
++            gpu->adapter = adapters[i].hAdapter;
++            gpu->luid = adapters[i].AdapterLuid;
++            npt_debug("virtgpu: opened adapter by PCI id (LUID %lx-%lx)",
++                      gpu->luid.HighPart, gpu->luid.LowPart);
++            found = true;
++            continue;
++         }
++      }
++      D3DKMT_CLOSEADAPTER close = { .hAdapter = adapters[i].hAdapter };
++      gpu->cb.closeAdapter(&close);
++   }
++   free(adapters);
++   return found;
++}
++
+ static bool
+ virtgpu_find_adapter(struct npt_virtgpu *gpu)
+ {
+@@ -1096,6 +1149,8 @@ virtgpu_find_adapter(struct npt_virtgpu *gpu)
+                 open.AdapterLuid.LowPart);
+       return true;
+    }
++   if (virtgpu_find_adapter_kmt(gpu))
++      return true;
+    npt_log("virtgpu: no PCI device matching %s", VIRTGPU_WIN_DEVICE_ID);
+    return false;
+ }

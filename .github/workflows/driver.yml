@@ -1,0 +1,155 @@
+name: Windows driver
+
+# Builds the test-signed Triton guest driver (viogpu3d KMD + Neptune UMD)
+# from upstream sources with the patches in driver/patches/ applied.
+# A v* tag also attaches the package to that GitHub Release.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths: ['driver/**', '.github/workflows/driver.yml']
+  pull_request:
+    paths: ['driver/**', '.github/workflows/driver.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  MESA_REPO: https://github.com/osy/virtio-win-mesa.git
+  MESA_REF: bf536bba65454900d782fa7417bc95c1608d7483
+  KMD_REPO: https://github.com/osy/kvm-guest-drivers-windows.git
+  KMD_REF: v0.4
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Version
+        shell: bash
+        run: |
+          # The fourth DriverVer field must stay below 65536 and should grow
+          # with every build so Windows prefers the newest package.
+          minor=$((58100 + GITHUB_RUN_NUMBER))
+          echo "_BUILD_MINOR_VERSION_=$minor" >> "$GITHUB_ENV"
+          echo "DRIVER_VERSION=100.6.101.$minor" >> "$GITHUB_ENV"
+
+      - name: Fetch sources
+        shell: bash
+        run: |
+          # Keep LF endings so the patches apply.
+          git config --global core.autocrlf false
+          git init -q mesa
+          git -C mesa fetch -q --depth 1 "$MESA_REPO" "$MESA_REF"
+          git -C mesa checkout -q FETCH_HEAD
+          git clone -q --depth 1 --branch "$KMD_REF" "$KMD_REPO" kmd
+          git -C mesa log -1 --oneline
+          git -C kmd log -1 --oneline
+
+      - name: Apply patches
+        shell: bash
+        run: |
+          for p in src/driver/patches/mesa/*.patch; do
+            [ -e "$p" ] || continue; echo "mesa: $p"; git -C mesa apply --whitespace=nowarn "../$p"
+          done
+          for p in src/driver/patches/kmd/*.patch; do
+            [ -e "$p" ] || continue; echo "kmd: $p"; git -C kmd apply --whitespace=nowarn "../$p"
+          done
+
+      - name: Build tools
+        shell: cmd
+        run: |
+          pip install meson mako pyyaml packaging || exit /b 1
+          curl.exe -sfLo ninja.zip https://github.com/ninja-build/ninja/releases/download/v1.13.1/ninja-win.zip || exit /b 1
+          mkdir tools && tar.exe -xf ninja.zip -C tools || exit /b 1
+          curl.exe -sfLo wfb.zip https://github.com/lexxmark/winflexbison/releases/download/v2.5.24/win_flex_bison-2.5.24.zip || exit /b 1
+          tar.exe -xf wfb.zip -C tools || exit /b 1
+          echo %CD%\tools>>"%GITHUB_PATH%"
+
+      - name: Build Mesa (x64, x86)
+        shell: cmd
+        run: |
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.VisualStudio.Workload.NativeDesktop -property installationPath') do set VS=%%i
+          for %%A in (x64 x86) do (
+            call :mesa %%A || exit /b 1
+          )
+          exit /b 0
+          :mesa
+          setlocal
+          set VULKAN=virtio
+          set EXTRA=
+          if "%1"=="x86" (
+            set VULKAN=
+            set EXTRA=-Dmin-windows-version=7
+          )
+          call "%VS%\Common7\Tools\VsDevCmd.bat" -arch=%1 -host_arch=x64 -startdir=none -no_logo || exit /b 1
+          meson setup mesa-build-%1 mesa ^
+            --cross-file src\driver\meson\meson-%1.txt ^
+            --prefix=%CD%\mesa-install-%1 ^
+            --default-library=static -Dbuildtype=release -Db_ndebug=true -Db_vscrt=mt ^
+            -Dc_args=/experimental:c11atomics ^
+            -Dllvm=disabled -Dplatforms=windows -Dvideo-codecs= ^
+            -Dgallium-drivers= -Dvulkan-drivers=%VULKAN% ^
+            -Dopengl=false -Degl=disabled -Dgles1=disabled -Dgles2=disabled ^
+            -Dneptune=true -Dnpt_wine=false -Dnpt_umd=both ^
+            -Dnpt_umd_version=%DRIVER_VERSION% %EXTRA% || exit /b 1
+          ninja -C mesa-build-%1 install || exit /b 1
+          endlocal
+          exit /b 0
+
+      - name: Build KMD (Win11 x64)
+        shell: cmd
+        run: |
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VS=%%i
+          call "%VS%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 -startdir=none -no_logo || exit /b 1
+          set MESA_PREFIX=%CD%\mesa-install-x64
+          set MESA_X86_PREFIX=%CD%\mesa-install-x86
+          cd kmd\viogpu
+          msbuild.exe -maxCpuCount viogpu.sln /p:Configuration="Win11 Release" /p:Platform=x64 || exit /b 1
+
+      - name: Test-sign and package
+        shell: pwsh
+        run: |
+          $dir = 'kmd\viogpu\Install\Win11\amd64'
+          if (-not (Test-Path "$dir\viogpu3d.inf")) { throw 'no packaged viogpu3d.inf' }
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+                      Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName | Select-Object -Last 1
+          $pfx = (Resolve-Path kmd\build\VirtIOTestCert.pfx).Path
+          Get-ChildItem $dir -Include viogpu3d.sys,*.dll,*.exe,viogpu3d.cat -Recurse | ForEach-Object {
+            & $signtool.FullName sign /fd SHA256 /f $pfx $_.FullName
+            if ($LASTEXITCODE) { throw "signing $($_.Name) failed" }
+          }
+          $out = "triton-driver-$env:DRIVER_VERSION"
+          New-Item -ItemType Directory "$out\licenses" | Out-Null
+          Copy-Item "$dir\*" $out -Exclude viogpudo*,*.pdb
+          Copy-Item kmd\build\VirtIOTestCert.cer $out
+          Copy-Item src\driver\package\install.cmd, src\driver\package\README.txt $out
+          Copy-Item kmd\viogpu\LICENSE "$out\licenses\viogpu-LICENSE.txt"
+          Copy-Item mesa\docs\license.rst "$out\licenses\mesa-license.rst"
+          if (Test-Path mesa\LICENSES) { Copy-Item mesa\LICENSES "$out\licenses\mesa-LICENSES" -Recurse }
+          Copy-Item src\LICENSE "$out\licenses\this-project-LICENSE.txt"
+          Compress-Archive "$out\*" "$out.zip"
+          Get-ChildItem $out -Recurse | Select-Object FullName, Length
+          "PACKAGE=$out" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}
+          path: ${{ env.PACKAGE }}.zip
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" "$PACKAGE.zip" --repo "$GITHUB_REPOSITORY" --clobber ||
+            gh release create "$GITHUB_REF_NAME" "$PACKAGE.zip" --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" --notes "See the README for install steps." --prerelease

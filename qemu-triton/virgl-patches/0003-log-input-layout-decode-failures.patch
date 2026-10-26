@@ -1,0 +1,68 @@
+diff --git a/src/neptune/neptune-protocol/npt_protocol_host_dispatch.h b/src/neptune/neptune-protocol/npt_protocol_host_dispatch.h
+index 15567aa..8bd7c46 100644
+--- a/src/neptune/neptune-protocol/npt_protocol_host_dispatch.h
++++ b/src/neptune/neptune-protocol/npt_protocol_host_dispatch.h
+@@ -5445,7 +5445,8 @@ npt_dispatch_command(struct npt_dispatch_context *ctx)
+     _dec->end = _stream_end;
+ 
+     if (npt_cs_decoder_get_fatal(_dec))
+-        npt_log("dispatch error for cmd_type=0x%08x", _hdr.cmd_type);
++        npt_log("dispatch error for cmd_type=0x%08x (cmd_size %u, flags 0x%x)",
++                _hdr.cmd_type, (unsigned)_hdr.cmd_size, (unsigned)_hdr.cmd_flags);
+ }
+ 
+ #pragma GCC diagnostic pop
+diff --git a/src/neptune/neptune-protocol/npt_protocol_host_id3d11device.h b/src/neptune/neptune-protocol/npt_protocol_host_id3d11device.h
+index 367f9b5..94f0efd 100644
+--- a/src/neptune/neptune-protocol/npt_protocol_host_id3d11device.h
++++ b/src/neptune/neptune-protocol/npt_protocol_host_id3d11device.h
+@@ -1353,7 +1353,11 @@ npt_decode_ID3D11Device_CreateInputLayout_args_temp(struct npt_cs_decoder *dec,
+     _has_cnt_pShaderBytecodeWithInputSignature = _cnt_pShaderBytecodeWithInputSignature != 0;
+     if (_cnt_pShaderBytecodeWithInputSignature) {
+         args->pShaderBytecodeWithInputSignature = npt_cs_decoder_alloc_temp(dec, _cnt_pShaderBytecodeWithInputSignature);
+-        if (!args->pShaderBytecodeWithInputSignature) return;
++        if (!args->pShaderBytecodeWithInputSignature) {
++            npt_log("CreateInputLayout: no temp space for %" PRIu64 " bytecode bytes",
++                    _cnt_pShaderBytecodeWithInputSignature);
++            return;
++        }
+         npt_decode_blob_array(dec, (void *)args->pShaderBytecodeWithInputSignature, _cnt_pShaderBytecodeWithInputSignature);
+     } else {
+         args->pShaderBytecodeWithInputSignature = NULL;
+@@ -1374,11 +1378,15 @@ npt_decode_ID3D11Device_CreateInputLayout_args_temp(struct npt_cs_decoder *dec,
+     /* A counted array must hold every element the callee walks. */
+     if ((_has_cnt_pInputElementDescs > 0 && _cnt_pInputElementDescs < (uint64_t)(args->NumElements)) ||
+         (_has_cnt_pInputElementDescs == 0 && (uint64_t)(args->NumElements) != 0)) {
++        npt_log("CreateInputLayout: %" PRIu64 " element descs on the wire, NumElements %u",
++                _cnt_pInputElementDescs, args->NumElements);
+         npt_cs_decoder_set_fatal(dec);
+         return;
+     }
+     if ((_has_cnt_pShaderBytecodeWithInputSignature > 0 && _cnt_pShaderBytecodeWithInputSignature < (uint64_t)(args->BytecodeLength)) ||
+         (_has_cnt_pShaderBytecodeWithInputSignature == 0 && (uint64_t)(args->BytecodeLength) != 0)) {
++        npt_log("CreateInputLayout: %" PRIu64 " bytecode bytes on the wire, BytecodeLength %" PRIu64,
++                _cnt_pShaderBytecodeWithInputSignature, (uint64_t)args->BytecodeLength);
+         npt_cs_decoder_set_fatal(dec);
+         return;
+     }
+@@ -1418,8 +1426,11 @@ npt_dispatch_ID3D11Device_CreateInputLayout(struct npt_dispatch_context *ctx,
+ 
+     npt_decode_ID3D11Device_CreateInputLayout_args_temp(ctx->decoder, &args);
+ 
+-    if (npt_cs_decoder_get_fatal(ctx->decoder))
++    if (npt_cs_decoder_get_fatal(ctx->decoder)) {
++        npt_log("CreateInputLayout: decode failed (NumElements %u, BytecodeLength %" PRIu64 ")",
++                args.NumElements, (uint64_t)args.BytecodeLength);
+         return;
++    }
+ 
+     args._self = npt_cs_handle_lookup(ctx, object_id,
+                                        NPT_OBJECT_TYPE_ID3D11DEVICE);
+@@ -1441,6 +1452,7 @@ npt_dispatch_ID3D11Device_CreateInputLayout(struct npt_dispatch_context *ctx,
+             npt_cs_decoder_reset_temp_pool(ctx->decoder);
+             return;
+         }
++        npt_log("CreateInputLayout: device 0x%016" PRIx64 " unknown", (uint64_t)object_id);
+         npt_cs_decoder_set_fatal(ctx->decoder);
+         return;
+     }
