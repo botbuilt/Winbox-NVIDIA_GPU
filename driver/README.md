@@ -9,7 +9,7 @@
 | Direct3D user-mode driver (`neptune_umd.dll`, 64-bit and 32-bit) and Venus Vulkan driver | [osy/virtio-win-mesa](https://github.com/osy/virtio-win-mesa) (Mesa fork) |
 
 The driver is the upstream authors' work. This folder only holds the build
-inputs and two fixes:
+inputs and three fixes:
 
 - [`patches/mesa/0001`](patches/mesa/0001-wow64-pointer-sized-wire-types.patch),
   **32-bit (WOW64) programs.** Handle- and pointer-sized values (`SIZE_T`,
@@ -23,6 +23,12 @@ inputs and two fixes:
   adapter, so D3D on the virtio GPU was unavailable ("D3D Status: Not
   Available" in dxdiag). It now also finds the GPU by its PCI ID
   (`1AF4:1050`).
+- [`patches/kmd/0001`](patches/kmd/0001-win10-paging-buffer-segment.patch),
+  **Windows 10.** The driver puts its paging buffers in system memory.
+  Windows 11 accepts that, but Windows 10's video memory manager
+  (`dxgmms2.sys`) then reads a missing allocation while setting up the GPU
+  and blue-screens (stop code 0x7E) as soon as the driver starts. On
+  Windows 10 the paging buffers now go in a GPU memory segment instead.
 
 ## Build details
 

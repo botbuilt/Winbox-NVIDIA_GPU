@@ -1,0 +1,56 @@
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index e8d4216..7130d6a 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -909,7 +909,19 @@ NTSTATUS VioGpuAdapter::QueryDeviceDescriptor(_In_ ULONG ChildUid, _Inout_ DXGK_
+ // The segment topology shared by DXGKQAITYPE_QUERYSEGMENT3 and 4: segment 1
+ // is the CPU-invisible aperture, optional segment 2 the CPU-visible host
+ // shmem window.
+-template <typename SEGMENTOUT> static void FillPagingBufferInfo(SEGMENTOUT *pSegmentInfo)
++
++// Windows 10 (build 19045 checked) VidMm's InitPagingProcessVaSpace maps the
++// first paging buffers into the paging process through their segment
++// allocation without a NULL check, so a system-memory paging pool bugchecks
++// 0x7E in dxgmms2 at adapter start.  Windows 11 handles segment 0.
++static BOOLEAN VioGpuPagingPoolNeedsSegment()
++{
++    RTL_OSVERSIONINFOW ver = {};
++    ver.dwOSVersionInfoSize = sizeof(ver);
++    return NT_SUCCESS(RtlGetVersion(&ver)) && ver.dwBuildNumber < 22000;
++}
++
++template <typename SEGMENTOUT> static void FillPagingBufferInfo(SEGMENTOUT *pSegmentInfo, UINT nbSegments)
+ {
+     // Room for the monitored-fence deferral to stamp a VIOGPU_DMA_PRIVATE
+     // into each paging buffer's private data (SIGNAL_MONITORED_FENCE); 0
+@@ -919,8 +931,10 @@ template <typename SEGMENTOUT> static void FillPagingBufferInfo(SEGMENTOUT *pSeg
+     // 0 = paging buffers from SYSTEM memory.  Segment 1 is the CPU-INVISIBLE
+     // aperture: pointing the paging pool there leaves
+     // VIDMM_DMA_POOL::BeginCPUAccess with nothing to map, and every TDR's
+-    // debug-info collection bugchecks 0x7E instead of recovering.
+-    pSegmentInfo->PagingBufferSegmentId = 0;
++    // debug-info collection bugchecks 0x7E instead of recovering.  Windows 10
++    // needs a segment, so it gets the CPU-visible shmem segment (2) when
++    // there is one and the aperture otherwise.
++    pSegmentInfo->PagingBufferSegmentId = VioGpuPagingPoolNeedsSegment() ? nbSegments : 0;
+     pSegmentInfo->PagingBufferSize = 10 * PAGE_SIZE;
+ }
+ 
+@@ -1109,7 +1123,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 if (pSegmentInfo->pSegmentDescriptor)
+                 {
+                     RtlZeroMemory(pSegmentInfo->pSegmentDescriptor, sizeof(DXGK_SEGMENTDESCRIPTOR3) * nbSegments);
+-                    FillPagingBufferInfo(pSegmentInfo);
++                    FillPagingBufferInfo(pSegmentInfo, nbSegments);
+                     FillApertureSegment(&pSegmentInfo->pSegmentDescriptor[0]);
+                     if (nbSegments == 2)
+                     {
+@@ -1149,7 +1163,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 }
+ 
+                 pSegmentInfo->NbSegment = nbSegments;
+-                FillPagingBufferInfo(pSegmentInfo);
++                FillPagingBufferInfo(pSegmentInfo, nbSegments);
+ 
+                 // pSegmentDescriptor is a BYTE* stride array: dxgkrnl OWNS
+                 // SegmentDescriptorStride (its per-element size, matching the
