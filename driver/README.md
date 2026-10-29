@@ -23,6 +23,11 @@ inputs and these changes:
   adapter, so D3D on the virtio GPU was unavailable ("D3D Status: Not
   Available" in dxdiag). It now also finds the GPU by its PCI ID
   (`1AF4:1050`).
+- [`patches/mesa/0003`](patches/mesa/0003-longer-ring-idle-timeout.patch),
+  **Fewer wake-ups per frame (test).** The host stopped watching an app's
+  command ring 1 ms after its last command, so nearly every frame had to
+  wake it again through the kernel driver. It now keeps watching for 8 ms.
+  The `NPT_RING_IDLE_MS` environment variable (1 to 100) overrides that.
 - [`patches/kmd/0001`](patches/kmd/0001-win10-paging-buffer-segment.patch),
   **Windows 10.** The driver puts its paging buffers in system memory.
   Windows 11 accepts that, but Windows 10's video memory manager

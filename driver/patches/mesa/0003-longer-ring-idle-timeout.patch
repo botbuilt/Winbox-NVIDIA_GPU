@@ -1,0 +1,69 @@
+diff --git a/src/virtio/neptune/npt_env.c b/src/virtio/neptune/npt_env.c
+index d86e13c..09d4e48 100644
+--- a/src/virtio/neptune/npt_env.c
++++ b/src/virtio/neptune/npt_env.c
+@@ -64,6 +64,10 @@ npt_env_init_impl(void)
+       parse_clamped_u32("NPT_PRESENT_GATE_TRACE", 0u, 0u, 60000u);
+    npt_env.event_waiter_trace_ms =
+       parse_clamped_u32("NPT_EVENT_WAITER_TRACE", 0u, 0u, 60000u);
++
++   /* WinBox: primary ring idle timeout, 1..100 ms (upstream: 1 ms). */
++   npt_env.ring_idle_ms =
++      parse_clamped_u32("NPT_RING_IDLE_MS", 8u, 1u, 100u);
+ }
+ 
+ static _Atomic int g_npt_env_init_state;
+diff --git a/src/virtio/neptune/npt_env.h b/src/virtio/neptune/npt_env.h
+index e43dbac..ce95cfb 100644
+--- a/src/virtio/neptune/npt_env.h
++++ b/src/virtio/neptune/npt_env.h
+@@ -87,6 +87,9 @@ struct npt_env {
+     * (waiting for a pool thread -- head-of-line pressure) and wait_us
+     * (the fence itself).  0 = off. */
+    uint32_t event_waiter_trace_ms; /* NPT_EVENT_WAITER_TRACE */
++   /* WinBox: how long the host polls an empty primary ring before it
++    * parks and the next submit has to ring the doorbell (npt_ring.c). */
++   uint32_t ring_idle_ms;          /* NPT_RING_IDLE_MS */
+ };
+ 
+ extern struct npt_env npt_env;
+diff --git a/src/virtio/neptune/npt_ring.c b/src/virtio/neptune/npt_ring.c
+index 9a31a09..34b1730 100644
+--- a/src/virtio/neptune/npt_ring.c
++++ b/src/virtio/neptune/npt_ring.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "npt_ring.h"
++#include "npt_env.h"
+ #include "npt_workaround.h"
+ #include "npt_device.h"
+ #include "npt_profile.h"
+@@ -22,8 +23,13 @@ static_assert(ATOMIC_INT_LOCK_FREE >= 1 && sizeof(atomic_uint) == 4,
+ static void
+ npt_ring_notify(struct npt_ring *ring);
+ 
+-#define NPT_RING_IDLE_TIMEOUT_NS (1000000) /* 1ms */
+-/* TLS rings park 10x longer than the primary ring's 1ms idle so
++/* WinBox: the primary ring's idle timeout comes from NPT_RING_IDLE_MS
++ * (npt_env.c, default 8 ms; it was a fixed 1 ms).  Every submit that
++ * follows the previous one by more than the timeout rings the doorbell,
++ * an escape into the kernel driver and a virtio round trip to the host,
++ * so at 1 ms nearly every frame paid one.  The host spends the extra
++ * idle time in its sleeping relax loop, which costs it little. */
++/* TLS rings park 10x longer than the upstream primary ring's 1ms idle so
+  * worker-thread traffic doesn't churn the host wakeup path.  +9ms
+  * worst-case first-submit-after-park latency. */
+ #define NPT_TLS_RING_IDLE_TIMEOUT_NS (10000000) /* 10ms */
+@@ -1519,9 +1525,10 @@ npt_ring_create(struct npt_device *device,
+    create_cmd.buffer_size = layout->buffer_size;
+    create_cmd.extra_offset = layout->extra_offset;
+    create_cmd.extra_size = layout->extra_size;
++   npt_env_init();
+    create_cmd.idle_timeout = is_tls_ring
+                                 ? NPT_TLS_RING_IDLE_TIMEOUT_NS
+-                                : NPT_RING_IDLE_TIMEOUT_NS;
++                                : (uint64_t)npt_env.ring_idle_ms * 1000000;
+    /* 10% early: a tick-rate error may cost a doorbell, never miss one. */
+    ring->doorbell_idle_ticks =
+       create_cmd.idle_timeout / 1000 * npt_ring_tick_hz() / 1000000 * 9 / 10;
