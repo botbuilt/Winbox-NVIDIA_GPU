@@ -86,7 +86,7 @@ index 6057bae..5de18b3 100644
  
      DbgPrint(TRACE_LEVEL_ERROR,
 diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
-index 737849c..fa583ee 100644
+index 737849c..7105cc9 100644
 --- a/viogpu/viogpu3d/viogpu_adapter.cpp
 +++ b/viogpu/viogpu3d/viogpu_adapter.cpp
 @@ -389,6 +389,30 @@ void VioGpuAdapter::CompleteFenceWithoutWork(UINT fenceId, UINT node, UINT engin
@@ -149,6 +149,26 @@ index 737849c..fa583ee 100644
  
                  pDriverCaps->SupportSmoothRotation = FALSE;
                  // The cap means "implements DxgkDdiStopDeviceAndReleasePost-
+@@ -1243,15 +1273,16 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                     (DXGK_PHYSICALADAPTERCAPS *)pQueryAdapterInfo->pOutputData;
+                 RtlZeroMemory(pCaps, pQueryAdapterInfo->OutputDataSize);
+ 
+-                // Single physical adapter, single execution node; node 0 is
+-                // also the paging node (matches GpuEngineTopology above).
++                // Single physical adapter; one execution node (two on
++                // Windows 10, see VioGpuHasIdleCopyNode), node 0 is also the
++                // paging node (matches GpuEngineTopology above).
+                 // DxgkPhysicalAdapterHandle is dxgkrnl's OWN handle for this
+                 // adapter -- MSDN: "Handle, which is passed to the kernel
+                 // mode driver as DXGKRNL_INTERFACE::DeviceHandle in
+                 // DxgkDdiStartDevice".  Anything else (a driver pointer, or
+                 // NULL) crashes dxgkrnl where it dereferences the handle
+                 // during node-name setup and VidMm adapter initialization.
+-                pCaps->NumExecutionNodes = 1;
++                pCaps->NumExecutionNodes = VioGpuHasIdleCopyNode() ? 2 : 1;
+                 pCaps->PagingNodeIndex = 0;
+                 pCaps->DxgkPhysicalAdapterHandle = m_DxgkInterface.DeviceHandle;
+                 pCaps->Flags.GpuMmuSupported = 1;
 diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
 index f78bb35..3bc163f 100644
 --- a/viogpu/viogpu3d/viogpu_adapter.h
