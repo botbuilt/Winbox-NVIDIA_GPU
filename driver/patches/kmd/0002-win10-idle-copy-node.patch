@@ -1,0 +1,184 @@
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+index 6057bae..5de18b3 100644
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -451,7 +451,7 @@ VioGpu3DDdiGetNodeMetadata(_In_ CONST HANDLE hAdapter,
+ 
+     // WDDMv2 packs the physical adapter index into the high word.
+     NodeOrdinal = DXGKNODEMETADATA_GETNODEORDINAL(NodeOrdinal);
+-    if (NodeOrdinal >= 1)
++    if (NodeOrdinal >= (VioGpuHasIdleCopyNode() ? 2u : 1u))
+     {
+         return STATUS_INVALID_PARAMETER;
+     }
+@@ -460,7 +460,7 @@ VioGpu3DDdiGetNodeMetadata(_In_ CONST HANDLE hAdapter,
+     // name (RtlAppendUnicodeStringToString) and an uninitialized array
+     // here is a kernel AV (bugcheck 0x7E during adapter init).
+     RtlZeroMemory(pGetNodeMetadata, sizeof(*pGetNodeMetadata));
+-    pGetNodeMetadata->EngineType = DXGK_ENGINE_TYPE_3D;
++    pGetNodeMetadata->EngineType = NodeOrdinal == 0 ? DXGK_ENGINE_TYPE_3D : DXGK_ENGINE_TYPE_COPY;
+     pGetNodeMetadata->Flags.Value = 0;
+     // A GpuMmu adapter whose only node claims no GpuMmu leaves VidMm
+     // with an inconsistent node description.
+@@ -1080,6 +1080,14 @@ VioGpu3DSubmitCommand(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SUBMITCOMMA
+                                            pSubmitCommand->EngineOrdinal);
+         return STATUS_SUCCESS;
+     }
++    if (pSubmitCommand->NodeOrdinal != 0)
++    {
++        // The idle Windows 10 copy node (VioGpuHasIdleCopyNode).
++        pAdapter->CompleteCopyNodeFence(pSubmitCommand->SubmissionFenceId,
++                                        pSubmitCommand->NodeOrdinal,
++                                        pSubmitCommand->EngineOrdinal);
++        return STATUS_SUCCESS;
++    }
+     return pAdapter->commander.SubmitCommand(pSubmitCommand);
+ };
+ #pragma code_seg(pop)
+@@ -1269,6 +1277,14 @@ VioGpu3DSubmitCommandVirtual(_In_ CONST HANDLE hAdapter,
+                                            pSubmitCommandVirtual->EngineOrdinal);
+         return STATUS_SUCCESS;
+     }
++    if (pSubmitCommandVirtual->NodeOrdinal != 0)
++    {
++        // The idle Windows 10 copy node (VioGpuHasIdleCopyNode).
++        pAdapter->CompleteCopyNodeFence(pSubmitCommandVirtual->SubmissionFenceId,
++                                        pSubmitCommandVirtual->NodeOrdinal,
++                                        pSubmitCommandVirtual->EngineOrdinal);
++        return STATUS_SUCCESS;
++    }
+     return pAdapter->commander.SubmitCommandVirtual(pSubmitCommandVirtual);
+ }
+ #pragma code_seg(pop)
+@@ -1668,6 +1684,13 @@ VioGpu3DDdiPreemptCommand(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_PREEMPT
+               __FUNCTION__, pPreemptCommand->PreemptionFenceId,
+               pPreemptCommand->NodeOrdinal, pPreemptCommand->EngineOrdinal));
+ 
++    if (pPreemptCommand->NodeOrdinal != 0)
++    {
++        pAdapter->PreemptCopyNode(pPreemptCommand->PreemptionFenceId,
++                                  pPreemptCommand->NodeOrdinal,
++                                  pPreemptCommand->EngineOrdinal);
++        return STATUS_SUCCESS;
++    }
+     pAdapter->ReportDmaPreempted(pPreemptCommand->PreemptionFenceId,
+                                  pPreemptCommand->NodeOrdinal,
+                                  pPreemptCommand->EngineOrdinal);
+@@ -1746,7 +1769,9 @@ VioGpu3DDdiQueryCurrentFence(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_QUERYCU
+ 
+     VioGpuAdapter *pAdapter = VioGpuAdapter::FromHandle(hAdapter);
+     VIOGPU_ASSERT_CHK(pAdapter != NULL);
+-    pCurrentFence->CurrentFence = InterlockedOr(&pAdapter->m_LastCompletedFenceId, 0);
++    pCurrentFence->CurrentFence = pCurrentFence->NodeOrdinal != 0
++                                      ? InterlockedOr(&pAdapter->m_CopyNodeFenceId, 0)
++                                      : InterlockedOr(&pAdapter->m_LastCompletedFenceId, 0);
+ 
+     return STATUS_SUCCESS;
+ };
+@@ -1767,7 +1792,8 @@ VioGpu3DDdiResetEngine(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_RESETENGINE *
+     // an uninitialised id.  There is one node here, so an engine reset is the
+     // adapter-wide fence sync-up: everything submitted is declared
+     // aborted/complete and the node is ready for new packets.
+-    UINT syncedTo = pAdapter->ResetFenceStateFromTimeout();
++    UINT syncedTo = pResetEngine->NodeOrdinal != 0 ? (UINT)InterlockedOr(&pAdapter->m_CopyNodeFenceId, 0)
++                                                   : pAdapter->ResetFenceStateFromTimeout();
+     pResetEngine->LastAbortedFenceId = syncedTo;
+ 
+     DbgPrint(TRACE_LEVEL_ERROR,
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 737849c..fa583ee 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -389,6 +389,30 @@ void VioGpuAdapter::CompleteFenceWithoutWork(UINT fenceId, UINT node, UINT engin
+     ReportDmaCompleted(fenceId, node, engine);
+ }
+ 
++void VioGpuAdapter::CompleteCopyNodeFence(UINT fenceId, UINT node, UINT engine)
++{
++    InterlockedExchange(&m_CopyNodeFenceId, (LONG)fenceId);
++    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
++    interrupt.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
++    interrupt.DmaCompleted.SubmissionFenceId = fenceId;
++    interrupt.DmaCompleted.NodeOrdinal = node;
++    interrupt.DmaCompleted.EngineOrdinal = engine;
++    NotifyInterrupt(&interrupt, TRUE);
++}
++
++void VioGpuAdapter::PreemptCopyNode(UINT preemptFenceId, UINT node, UINT engine)
++{
++    // Nothing is ever queued on the copy node, so every packet up to the last
++    // submitted one has completed and the preempt acks immediately.
++    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
++    interrupt.InterruptType = DXGK_INTERRUPT_DMA_PREEMPTED;
++    interrupt.DmaPreempted.PreemptionFenceId = preemptFenceId;
++    interrupt.DmaPreempted.LastCompletedFenceId = (UINT)InterlockedOr(&m_CopyNodeFenceId, 0);
++    interrupt.DmaPreempted.NodeOrdinal = node;
++    interrupt.DmaPreempted.EngineOrdinal = engine;
++    NotifyInterrupt(&interrupt, TRUE);
++}
++
+ NTSTATUS VioGpuAdapter::NotifyInterrupt(DXGKARGCB_NOTIFY_INTERRUPT_DATA *interruptData, BOOL triggerDpc)
+ {
+     NOTIFY_CONTEXT notify;
+@@ -440,6 +464,7 @@ VioGpuAdapter::VioGpuAdapter(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
+     // Pool memory is NOT zeroed, and the vsync fence echo reports these
+     // as completed ids from the first tick.
+     m_LastCompletedFenceId = 0;
++    m_CopyNodeFenceId = 0;
+     m_PreemptSkipThroughFenceId = 0;
+     m_LastSubmittedFenceId = 0;
+     m_PreemptPending = FALSE;
+@@ -921,6 +946,11 @@ static BOOLEAN VioGpuPagingPoolNeedsSegment()
+     return NT_SUCCESS(RtlGetVersion(&ver)) && ver.dwBuildNumber < 22000;
+ }
+ 
++BOOLEAN VioGpuHasIdleCopyNode()
++{
++    return VioGpuPagingPoolNeedsSegment();
++}
++
+ template <typename SEGMENTOUT> static void FillPagingBufferInfo(SEGMENTOUT *pSegmentInfo)
+ {
+     // Room for the monitored-fence deferral to stamp a VIOGPU_DMA_PRIVATE
+@@ -1069,7 +1099,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 pDriverCaps->SchedulingCaps.MultiEngineAware = 1;
+                 pDriverCaps->SchedulingCaps.PreemptionAware = 1;
+ 
+-                pDriverCaps->GpuEngineTopology.NbAsymetricProcessingNodes = 1;
++                pDriverCaps->GpuEngineTopology.NbAsymetricProcessingNodes = VioGpuHasIdleCopyNode() ? 2 : 1;
+ 
+                 pDriverCaps->SupportSmoothRotation = FALSE;
+                 // The cap means "implements DxgkDdiStopDeviceAndReleasePost-
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index f78bb35..3bc163f 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -35,6 +35,14 @@
+ #include "viogpu_command.h"
+ #include "viogpu_vidpn.h"
+ 
++// Windows 10 only (PASSIVE_LEVEL): expose a second, idle copy node.  With a
++// single node, the Windows 10 scheduler (dxgmms2 19045 SelectContext) always
++// picks node 0 and ignores its packet credits; once they run out it spins
++// holding the scheduler lock that the completion DPC needs to return them,
++// and the whole guest freezes.  With two nodes it takes the multi-node path,
++// which skips nodes without credits.  Windows 11 has no such loop.
++BOOLEAN VioGpuHasIdleCopyNode();
++
+ // GpuMmu page-table geometry: the x86-64 shape -- 48-bit VA split into a
+ // 12-bit page offset and 4 levels of 9 index bits, each level a 4KB table of
+ // 512 8-byte PTEs in system memory.  Anything unusual here is a shape VidMm
+@@ -353,6 +361,13 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
+     // this cannot regress the watermark.
+     void CompleteFenceWithoutWork(UINT fenceId, UINT node, UINT engine);
+ 
++    // Windows 10 only: a second, idle copy node (see HasIdleCopyNode).
++    // Nothing runs on it; its packets complete on submission and its
++    // preempts ack at once, with their own fence sequence kept here.
++    volatile LONG m_CopyNodeFenceId;
++    void CompleteCopyNodeFence(UINT fenceId, UINT node, UINT engine);
++    void PreemptCopyNode(UINT preemptFenceId, UINT node, UINT engine);
++
+     // TDR recovery.  DxgkDdiResetFromTimeout must leave the adapter in a
+     // state where the scheduler can resume: everything it submitted has to
+     // read as completed (it re-owns those packets and resubmits under fresh
