@@ -9,7 +9,7 @@
 | Direct3D user-mode driver (`neptune_umd.dll`, 64-bit and 32-bit) and Venus Vulkan driver | [osy/virtio-win-mesa](https://github.com/osy/virtio-win-mesa) (Mesa fork) |
 
 The driver is the upstream authors' work. This folder only holds the build
-inputs and three fixes:
+inputs and these changes:
 
 - [`patches/mesa/0001`](patches/mesa/0001-wow64-pointer-sized-wire-types.patch),
   **32-bit (WOW64) programs.** Handle- and pointer-sized values (`SIZE_T`,
@@ -29,6 +29,22 @@ inputs and three fixes:
   (`dxgmms2.sys`) then reads a missing allocation while setting up the GPU
   and blue-screens (stop code 0x7E) as soon as the driver starts. On
   Windows 10 the paging buffers now go in a GPU memory segment instead.
+- [`patches/kmd/0002`](patches/kmd/0002-win10-idle-copy-node.patch),
+  **Windows 10 freeze.** With a single GPU engine, Windows 10's scheduler
+  can spin forever while holding its lock, which froze Windows as soon as a
+  browser used the GPU. On Windows 10 the driver now reports a second, idle
+  copy engine that completes its work at once, so the scheduler takes its
+  normal path.
+- [`patches/kmd/0003`](patches/kmd/0003-overlap-host-round-trips.patch),
+  **More work in flight (test).** The driver ran one GPU packet at a time
+  and kept that slot while it waited for the host to answer, so every
+  packet from every app waited for the one before it. A packet whose last
+  command is already on its way to the host (or only waits for the GPU to
+  finish) now gives its slot back, and the next packet starts. Packets
+  still reach the host in order and still report as finished in order.
+- [`patches/kmd/0004`](patches/kmd/0004-msi-interrupts.patch),
+  **MSI interrupts (test).** The GPU's three message interrupts (display
+  change, commands, cursor) are now used instead of one shared interrupt.
 
 ## Build details
 

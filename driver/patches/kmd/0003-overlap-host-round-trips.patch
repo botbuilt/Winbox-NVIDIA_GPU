@@ -1,0 +1,126 @@
+diff --git a/viogpu/viogpu3d/viogpu_command.cpp b/viogpu/viogpu3d/viogpu_command.cpp
+index 3a8798f..5248875 100644
+--- a/viogpu/viogpu3d/viogpu_command.cpp
++++ b/viogpu/viogpu3d/viogpu_command.cpp
+@@ -25,6 +25,7 @@ VioGpuCommand::VioGpuCommand(VioGpuAdapter *adapter)
+     m_KmdAuthored = FALSE;
+     m_pendingCallbacks = 0;
+     m_notified = 0;
++    m_SlotReleased = FALSE;
+     m_pDmaBuffer = NULL;
+     m_pCommand = NULL;
+     m_pEnd = NULL;
+@@ -393,7 +394,9 @@ void VioGpuCommand::Run()
+                         {
+                             goto end;
+                         }
++                        return;
+                     }
++                    ReleaseSlotIfTail();
+                     return;
+                 }
+ 
+@@ -414,6 +417,7 @@ void VioGpuCommand::Run()
+                     RtlCopyMemory(&token, cmdBody, sizeof(token));
+                     AddPending();
+                     m_pAdapter->GateConsume(token, VioGpuCommand::QueueRunningCb, this, m_FenceId);
++                    ReleaseSlotIfTail();
+                     return;
+                 }
+ 
+@@ -442,6 +446,7 @@ void VioGpuCommand::Run()
+                     RtlCopyMemory(&token, cmdBody, sizeof(token));
+                     AddPending();
+                     m_pAdapter->PresentWaitConsume(token, VioGpuCommand::QueueRunningCb, this, m_FenceId);
++                    ReleaseSlotIfTail();
+                     return;
+                 }
+ 
+@@ -647,11 +652,40 @@ end:
+     // (NullRendering, empty bodies) have no DPC callback and retire here.
+     NotifyCompletion();
+ 
+-    m_pCommander->CommandFinished();
++    // A tail-parked command already gave its slot back.
++    if (!m_SlotReleased)
++    {
++        m_pCommander->CommandFinished();
++    }
+ 
+     delete this;
+ }
+ 
++void VioGpuCommand::ReleaseSlotIfTail()
++{
++    PAGED_CODE();
++
++    // Only once nothing of the body is left to run: a command with more body
++    // after the park point still has host commands to issue, and letting a
++    // later packet's commands reach the virtqueue first would reorder them.
++    // At the tail the host has every command of this packet already (the
++    // ctrl queue is FIFO) or none at all (GATE / PRESENT_WAIT never touch
++    // virtio), so a later packet may run now.  Its fence still reports only
++    // after this one's: the completion-contiguity window in
++    // ReportCompletedSyncRoutine raises the highest CONTIGUOUS id.  The
++    // preempt target (PreemptHold) stays the highest id ever started, so a
++    // preempt still acks only once everything started has completed.
++    //
++    // The parked completion may already have fired and re-queued this
++    // command; that is fine, only this worker thread runs or frees it.
++    if (m_SlotReleased || m_pCommand < m_pEnd)
++    {
++        return;
++    }
++    m_SlotReleased = TRUE;
++    m_pCommander->ReleaseSlot();
++}
++
+ void VioGpuCommand::Discard()
+ {
+     PAGED_CODE();
+@@ -1002,6 +1036,18 @@ void VioGpuCommander::CommandFinished()
+     KeSetEvent(&m_QueueEvent, IO_NO_INCREMENT, FALSE);
+ }
+ 
++void VioGpuCommander::ReleaseSlot()
++{
++    PAGED_CODE();
++    DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s", __FUNCTION__));
++
++    // Same worker-thread-only accounting as CommandFinished; the event makes
++    // the worker go back for the next submitted packet as soon as the
++    // running queue drains.
++    m_running--;
++    KeSetEvent(&m_QueueEvent, IO_NO_INCREMENT, FALSE);
++}
++
+ PAGED_CODE_SEG_END
+ 
+ #pragma code_seg(push)
+diff --git a/viogpu/viogpu3d/viogpu_command.h b/viogpu/viogpu3d/viogpu_command.h
+index 5064ea2..b52d471 100644
+--- a/viogpu/viogpu3d/viogpu_command.h
++++ b/viogpu/viogpu3d/viogpu_command.h
+@@ -177,6 +177,13 @@ class VioGpuCommand final : public HandleBase<"VIOGCOMM"_M, VioGpuCommand>
+     // exactly once -- when the last outstanding async submission completes.
+     LONG DropPending();
+ 
++    // Tail park: the command just parked on its LAST body command (a fenced
++    // SUBMIT already queued to the host, or a GATE / PRESENT_WAIT), so all
++    // that is left is completion -- give its running slot back now instead
++    // of at `end:`, letting the next packet start while this one waits.
++    void ReleaseSlotIfTail();
++    BOOLEAN m_SlotReleased;
++
+     char *m_pDmaBuffer;
+     char *m_pCommand;
+     char *m_pEnd;
+@@ -212,6 +219,8 @@ class VioGpuCommander
+     void Stop();
+ 
+     void CommandFinished();
++    // A parked command returning its slot early (VioGpuCommand::ReleaseSlotIfTail).
++    void ReleaseSlot();
+ 
+     NTSTATUS Patch(const DXGKARG_PATCH *pPatch);
+     NTSTATUS SubmitCommand(const DXGKARG_SUBMITCOMMAND *pSubmitCommand);

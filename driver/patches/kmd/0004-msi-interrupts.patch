@@ -1,0 +1,18 @@
+diff --git a/viogpu/viogpu3d/viogpu3d.inx b/viogpu/viogpu3d/viogpu3d.inx
+index 611c0f3..6e10e45 100644
+--- a/viogpu/viogpu3d/viogpu3d.inx
++++ b/viogpu/viogpu3d/viogpu3d.inx
+@@ -109,9 +109,12 @@ HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler",EnablePreempti
+ HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",TdrDebugMode,%REG_DWORD%,1
+ 
+ [VioGpu3D_PCI_MSIX]
++; MSI-X: QEMU's virtio GPU has 3 vectors (config change, control queue,
++; cursor) and InterruptRoutine maps them by message number, so each
++; completion skips the shared line interrupt and its ISR status read.
+ HKR, "Interrupt Management",, 0x00000010
+ HKR, "Interrupt Management\MessageSignaledInterruptProperties",, 0x00000010
+-HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, 0x00010001, 0
++HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, 0x00010001, 1
+ HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, 0x00010001, 4
+ ;HKR, "Interrupt Management\Affinity Policy",, 0x00000010
+ ;HKR, "Interrupt Management\Affinity Policy", DevicePolicy, 0x00010001, 5
