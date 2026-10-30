@@ -1,5 +1,12 @@
 # syntax=docker/dockerfile:1
 
+# Sunshine for STREAM=Y (see sunshine/README.md). v2026.1028.122642
+ARG SUNSHINE_REF="d7e5fe00701539a5be4a0304239730e1dfec4cf9"
+# CUDA 13 can't build for Pascal GPUs (GTX 10-series, Quadro P) any more, so
+# Sunshine is built with the last CUDA 12. NVIDIA's Debian 12 repository has it.
+ARG CUDA_REPO="https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64"
+ARG CUDA_PACKAGE_VERSION="12-9"
+ARG CUDA_DIR="/usr/local/cuda-12.9"
 
 # ---------------------------------------------------------------------------
 # Stage 1: QEMU for the Triton DirectX 11 driver (see qemu-triton/README.md).
@@ -158,7 +165,7 @@ RUN <<'EOF_BUILD'
   extra_ldflags="$(dpkg-buildflags --get LDFLAGS) -Wl,--disable-new-dtags,-rpath,$PREFIX/lib"
 
   /src/qemu/configure \
-    --with-pkgversion="winbox-triton ${VERSION_ARG}" \
+    --with-pkgversion="winbox-nvidia-gpu ${VERSION_ARG}" \
     --target-list=x86_64-softmmu \
     --prefix=/usr \
     --libdir="/usr/lib/${multiarch}" \
@@ -282,13 +289,132 @@ RUN <<'EOF_VERIFY'
   cat /tmp/help
   grep -F "neptune=" /tmp/help
   grep -F "host3d_blob_limit=" /tmp/help
+  grep -F "refresh_rate=" /tmp/help
   /usr/bin/qemu-system-x86_64 -display help | grep -F "egl-headless"
 
   rm /tmp/help
 EOF_VERIFY
 
 # ---------------------------------------------------------------------------
-# Stage 2: Windows in a container for Unraid, based on dockurr/windows.
+# Stage 2: Sunshine with WinBox's QEMU capture source, so STREAM=Y can stream
+# Windows to Moonlight with the video encoded on the GPU (NVENC) on the host.
+# Built on Debian trixie like dockurr/windows, so the package's library
+# dependencies match the image it is installed in.
+
+# NVIDIA's repository key is bound with a SHA-1 signature, which trixie's apt
+# no longer accepts. Debian 12's apt still verifies it, so it downloads the
+# CUDA packages, and the trixie builder installs those files.
+FROM debian:bookworm AS cuda
+
+ARG CUDA_REPO
+ARG CUDA_PACKAGE_VERSION
+ARG DEBIAN_FRONTEND="noninteractive"
+
+RUN <<'EOF_CUDA_DOWNLOAD'
+  set -eu
+  apt-get update
+  apt-get install --no-install-recommends -y ca-certificates wget
+  wget -q "$CUDA_REPO/cuda-keyring_1.1-1_all.deb" -O /tmp/cuda-keyring.deb
+  dpkg -i /tmp/cuda-keyring.deb
+  apt-get update
+  apt-get install --download-only --no-install-recommends -y \
+    "cuda-nvcc-$CUDA_PACKAGE_VERSION" \
+    "cuda-cudart-dev-$CUDA_PACKAGE_VERSION" \
+    "cuda-driver-dev-$CUDA_PACKAGE_VERSION"
+  mkdir /cuda
+  cp /var/cache/apt/archives/cuda-*.deb /cuda/
+  ls /cuda
+EOF_CUDA_DOWNLOAD
+
+FROM debian:trixie AS sunshine-builder
+
+ARG SUNSHINE_REF
+ARG CUDA_DIR
+ARG DEBIAN_FRONTEND="noninteractive"
+
+RUN <<EOF_SUNSHINE_TOOLS
+  set -eu
+  apt-get update
+  apt-get install --no-install-recommends -y ca-certificates git wget
+  rm -rf /var/lib/apt/lists/*
+EOF_SUNSHINE_TOOLS
+
+WORKDIR /src
+
+RUN <<'EOF_SUNSHINE_SOURCE'
+  set -eu
+  git init -q .
+  git remote add origin https://github.com/LizardByte/Sunshine.git
+  git fetch -q --depth=1 origin "$SUNSHINE_REF"
+  git checkout -q --detach FETCH_HEAD
+  git submodule -q update --init --depth=1 --recursive
+  echo "Sunshine: $(git rev-parse HEAD)"
+EOF_SUNSHINE_SOURCE
+
+COPY sunshine/patches /tmp/sunshine-patches
+
+RUN <<'EOF_SUNSHINE_PATCH'
+  set -eu
+  for patch in /tmp/sunshine-patches/*.patch; do
+    echo "Applying ${patch##*/}..."
+    git apply --check "$patch"
+    git apply "$patch"
+  done
+EOF_SUNSHINE_PATCH
+
+# Sunshine's own script installs the build dependencies; CUDA comes next.
+RUN <<'EOF_SUNSHINE_DEPS'
+  set -eu
+  ./scripts/linux_build.sh --step=deps --skip-cuda --sudo-off
+  rm -rf /var/lib/apt/lists/*
+EOF_SUNSHINE_DEPS
+
+COPY --from=cuda /cuda /tmp/cuda
+
+RUN <<'EOF_SUNSHINE_CUDA'
+  set -eu
+  apt-get update
+  apt-get install --no-install-recommends -y /tmp/cuda/*.deb
+  rm -rf /var/lib/apt/lists/* /tmp/cuda
+
+  # glibc 2.41 declares rsqrt, sinpi and cospi with noexcept; CUDA 12's
+  # headers don't, and nvcc rejects the mismatch. Sunshine ships the fix.
+  patch -p2 --directory="$CUDA_DIR" \
+    < packaging/linux/patches/x86_64/cuda-12-math_functions.patch
+  "$CUDA_DIR/bin/nvcc" --version
+EOF_SUNSHINE_CUDA
+
+RUN <<'EOF_SUNSHINE_BUILD'
+  set -eu
+  export CC=gcc-14 CXX=g++-14
+  cmake -B build -G Ninja -S . \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DSUNSHINE_ASSETS_DIR=share/sunshine \
+    -DSUNSHINE_EXECUTABLE_PATH=/usr/bin/sunshine \
+    -DSUNSHINE_ENABLE_DRM=ON \
+    -DSUNSHINE_ENABLE_KWIN=ON \
+    -DSUNSHINE_ENABLE_PORTAL=ON \
+    -DSUNSHINE_ENABLE_WAYLAND=ON \
+    -DSUNSHINE_ENABLE_X11=ON \
+    -DSUNSHINE_ENABLE_TRAY=OFF \
+    -DSUNSHINE_ENABLE_CUDA=ON \
+    -DCMAKE_CUDA_COMPILER="$CUDA_DIR/bin/nvcc" \
+    -DCMAKE_CUDA_HOST_COMPILER=gcc-14 \
+    -DBUILD_DOCS=OFF \
+    -DBUILD_TESTS=OFF \
+    -DSUNSHINE_PUBLISHER_NAME=WinBox \
+    -DSUNSHINE_PUBLISHER_WEBSITE=https://github.com/botbuilt/Winbox-NVIDIA_GPU \
+    -DSUNSHINE_PUBLISHER_ISSUE_URL=https://github.com/botbuilt/Winbox-NVIDIA_GPU/issues
+  ninja -C build
+  cpack -G DEB --config ./build/CPackConfig.cmake
+  mkdir /out
+  cp build/cpack_artifacts/*.deb /out/sunshine.deb
+  ls -l /out
+EOF_SUNSHINE_BUILD
+
+# ---------------------------------------------------------------------------
+# Stage 3: Windows in a container for Unraid, based on dockurr/windows.
 # Adds a startup hook that checks shared (Nvidia/Intel/AMD) GPU setups on
 # Unraid, and handles optional VFIO GPU/PCI passthrough and USB passthrough.
 
@@ -296,9 +422,9 @@ EOF_VERIFY
 # Dependabot opens a PR when dockurr/windows publishes a new release.
 FROM dockurr/windows:6.06@sha256:16fd7c39a3e48bb946d29c59dc6015942e5b900a1fa5d7e5552053bfc48ee2ea
 
-LABEL org.opencontainers.image.title="winbox-triton" \
-      org.opencontainers.image.description="Windows VM in a container for Unraid, with DirectX 11 on a shared GPU through Triton" \
-      org.opencontainers.image.source="https://github.com/botbuilt/Winbox-triton-driver" \
+LABEL org.opencontainers.image.title="winbox-nvidia-gpu" \
+      org.opencontainers.image.description="Windows in a box for Unraid: a Windows VM in a container with DirectX 11 on a shared NVIDIA GPU (Triton) and Moonlight streaming encoded on the GPU (Sunshine, NVENC)" \
+      org.opencontainers.image.source="https://github.com/botbuilt/Winbox-NVIDIA_GPU" \
       org.opencontainers.image.licenses="MIT"
 
 # Nvidia's Vulkan driver (libGLX_nvidia.so.0, injected by the Nvidia runtime)
@@ -337,3 +463,11 @@ ENV VGA="virtio-vga-gl,neptune=true" \
     NPT_D3D11_LIBRARY_PATH="/opt/neptune/lib/libdxvk_d3d11.so.0" \
     NPT_DXGI_LIBRARY_PATH="/opt/neptune/lib/libdxvk_dxgi.so.0" \
     DXVK_WSI_DRIVER="Headless"
+
+# Sunshine with the QEMU capture source, started by STREAM=Y.
+COPY --from=sunshine-builder /out/sunshine.deb /tmp/sunshine.deb
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends /tmp/sunshine.deb \
+ && rm -rf /var/lib/apt/lists/* /tmp/sunshine.deb \
+ && ! ldd /usr/bin/sunshine | grep -F "not found" \
+ && grep -qF "QEMU stream" /usr/bin/sunshine

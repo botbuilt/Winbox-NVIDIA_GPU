@@ -1,9 +1,16 @@
-# WinBox (Triton)
+# WinBox NVIDIA GPU
 
-Windows 10/11 (or Server) in a Docker container on Unraid, with persistent
-storage on your shares and **DirectX 11 on a GPU that stays shared** with
-Unraid and your other containers (Plex, Jellyfin, AI apps, ...). No GPU
-passthrough, no VFIO binding.
+**Windows in a box with an NVIDIA GPU.** Windows 10/11 (or Server) in a
+Docker container on Unraid, with persistent storage on your shares and an
+NVIDIA card that **stays shared** with Unraid and your other containers
+(Plex, Jellyfin, AI apps, ...). No GPU passthrough, no VFIO binding.
+
+- **DirectX 11 in Windows on the GPU**, through the Triton driver.
+- **Moonlight streaming encoded on the GPU.** Sunshine runs in the
+  container and encodes Windows' screen with NVENC (built with CUDA 12), so
+  Windows spends no CPU time on capturing and encoding the stream.
+- Installs Windows by itself, with Remote Desktop, a browser console, an
+  Unraid share as drive Z:, backups and snapshots.
 
 > **Built with AI.** The code, scripts, patches and docs in this repository
 > were written by an AI coding assistant, directed and tested by the
@@ -20,6 +27,7 @@ passthrough, no VFIO binding.
 |---|---|
 | Container (`Dockerfile`, `src/`) | [dockurr/windows](https://github.com/dockur/windows) (runs Windows in QEMU/KVM inside the container and installs it automatically) plus an Unraid startup hook that checks the shared GPU setup and explains any missing setting |
 | Host GPU stack (`qemu-triton/`) | QEMU, virglrenderer and DXVK with [Triton](https://blog.getutm.app/2026/introducing-triton-directx-11-driver-for-qemu/) support, built from pinned upstream commits with a few fixes for Nvidia and Linux |
+| Streaming (`sunshine/`) | [Sunshine](https://github.com/LizardByte/Sunshine) with a capture source that takes Windows' screen straight from QEMU and encodes it with NVENC, for [Moonlight](https://moonlight-stream.org/) |
 | Windows driver (`driver/`) | A GitHub Actions build of the Triton guest driver, test-signed, with fixes for 32-bit games and Remote Desktop |
 | Unraid extras (`unraid/`, `scripts/`) | Community Applications template, backup, snapshot and clean-shutdown User Scripts |
 
@@ -31,17 +39,26 @@ keeps owning it, and the container gets access the same way Plex does
 Direct3D 11 calls to the host, where DXVK runs them on your card through
 Vulkan.
 
+With streaming on (`STREAM=Y`), QEMU hands each finished Windows frame to
+Sunshine in the container as a GPU buffer, without a copy through RAM.
+Sunshine encodes it on the same card with NVENC and sends it to Moonlight,
+and Moonlight's keyboard and mouse go straight back into the VM. Nothing
+needs to be installed in Windows for it.
+
 What to expect:
 
 - DirectX 11 (feature level 11_1) for games and apps, a GPU-accelerated
   desktop, browsers and video. 64-bit and 32-bit games.
 - **No DirectX 12** (Triton's DirectX 12 support is still early), no Nvidia
-  driver inside Windows (no CUDA, NVENC or DLSS), and the driver needs
-  Windows test mode, which some anti-cheat games refuse.
+  driver inside Windows (no CUDA, NVENC or DLSS for Windows programs), and
+  the driver needs Windows test mode, which some anti-cheat games refuse.
+  CUDA and NVENC are used by the container, for streaming.
 - The desktop feels less snappy than on real hardware, and every program
   that uses the GPU gets its own helper process on the host. Plan memory
   for that (see [Memory](#memory)).
-- Tested with an Nvidia card. Intel and AMD may work but are untested.
+- Tested on a Pascal-generation NVIDIA Quadro card. Newer NVIDIA cards
+  should work. Intel and AMD may work for DirectX but are untested, and
+  streaming needs NVIDIA.
 
 ## Requirements
 
@@ -51,6 +68,7 @@ What to expect:
 | Unraid **7.3+** (Linux 6.13+) | virtio-gpu host memory blobs |
 | **Nvidia Driver** plugin, driver **570.86+**, `nvidia_drm` modesetting on | Vulkan, GBM and dma-buf sharing on the host |
 | A cache/SSD pool for the vdisk | Performance |
+| An NVIDIA GPU, GTX 900 / Quadro M series or newer | DirectX 11 on the GPU and NVENC streaming (see [NVIDIA GPUs and CUDA](#nvidia-gpus-and-cuda)) |
 | A valid Windows license | WinBox downloads Windows from Microsoft; it contains no Windows code |
 
 ## Setup on Unraid
@@ -78,7 +96,7 @@ In the Unraid terminal:
 
 ```bash
 wget -O /boot/config/plugins/dockerMan/templates-user/my-WinBox.xml \
-  https://raw.githubusercontent.com/botbuilt/Winbox-triton-driver/main/unraid/winbox.xml
+  https://raw.githubusercontent.com/botbuilt/Winbox-NVIDIA_GPU/main/unraid/winbox.xml
 ```
 
 Then **Docker → Add Container → Template: WinBox**.
@@ -94,6 +112,7 @@ Then **Docker → Add Container → Template: WinBox**.
 | Shared folder (Z:) | Any share, e.g. `/mnt/user/windows-share` |
 | GPU acceleration | `Y` |
 | Nvidia GPU UUID | The `GPU-…` value from step 1 |
+| Moonlight streaming | `Y` to stream with Moonlight (see [Streaming with Moonlight](#streaming-with-moonlight)), else `N` |
 
 **Extra Parameters** (Advanced view) is already
 `--runtime=nvidia --device=/dev/dri --cap-add=NET_ADMIN --stop-timeout=120 --memory=16g --memory-swap=16g`
@@ -161,7 +180,8 @@ too short. It stays quiet once it's long enough.
 - **Password:** WinBox refuses to start with an empty or default password
   (`admin`, `change-me`, ...). The same password protects the web console
   (`PROTECT=Y`).
-- **Don't expose ports 3389 or 8006 to the internet.** RDP is a top target for
+- **Don't expose ports 3389, 8006 or Sunshine's ports (47984-48010) to the
+  internet.** RDP is a top target for
   brute-force attacks. For remote access use Tailscale, WireGuard (built into
   Unraid under Settings → VPN Manager), or a reverse proxy with SSO in front of
   the web console.
@@ -169,8 +189,8 @@ too short. It stays quiet once it's long enough.
 - **Images are signed.** Each published image is signed with Sigstore cosign
   and ships an SBOM and build provenance. To verify:
   ```bash
-  cosign verify ghcr.io/botbuilt/winbox-triton:latest \
-    --certificate-identity-regexp 'https://github.com/botbuilt/Winbox-triton-driver/' \
+  cosign verify ghcr.io/botbuilt/winbox-nvidia-gpu:latest \
+    --certificate-identity-regexp 'https://github.com/botbuilt/Winbox-NVIDIA_GPU/' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```
   Vulnerability scan results (Trivy) are in the repo's Security tab.
@@ -202,7 +222,61 @@ Fewer helpers: turn off Widgets, Edge "Startup boost" and "Continue running
 background apps", unneeded startup apps, and sign out of Remote Desktop
 instead of only disconnecting.
 
-## Remote Desktop and streaming
+## Streaming with Moonlight
+
+With **Moonlight streaming** (`STREAM=Y`), Sunshine starts in the container
+next to Windows. Moonlight on a PC, phone, TV or tablet then streams the
+Windows desktop and games, with the video encoded by the NVIDIA card.
+
+1. In the template set **GPU acceleration** = `Y`, **Moonlight streaming** =
+   `Y`, and leave **Sound** at `Y` (that carries the sound to Moonlight).
+   The Sunshine ports (TCP 47984, 47989, 47990, 48010 and UDP 47998-48000)
+   are in the template's Advanced view; keep them mapped to the same numbers.
+2. Open Sunshine's web UI at `https://<unraid-ip>:47990` (accept the
+   self-signed certificate). Its login starts out as the template's
+   username and password.
+3. In Moonlight, add the host by `<unraid-ip>`, pick it, and enter the PIN it
+   shows on Sunshine's **PIN** page. Then start **Desktop**.
+
+Good to know:
+
+- Sunshine's settings, pairings and login live in `<storage>/sunshine`, so
+  they survive container updates. Its log is `/var/log/sunshine.log` in the
+  container (`docker exec WinBox tail -50 /var/log/sunshine.log`).
+- Don't also run Sunshine inside Windows: with `STREAM=Y` the container
+  takes its ports.
+- For games that turn the camera with the mouse, Moonlight sends relative
+  mouse moves; on the desktop it sends absolute ones. If a game's mouse
+  feels slow, raise the in-game sensitivity.
+- Windows' screen size isn't changed to match the Moonlight client yet. Set
+  it in Windows' display settings. For 120 fps streams, give Windows a 120 Hz
+  monitor with `VGA=virtio-vga-gl,neptune=true,refresh_rate=120`.
+- Moonlight has no clipboard sharing. Use Remote Desktop when you need it.
+- With user-mode networking (`NETWORK=user`, for example behind a VPN
+  container), Sunshine's ports are removed from `USER_PORTS` automatically
+  so they reach Sunshine and not Windows.
+- Each stream uses one NVENC session on the card. GeForce cards allow a
+  limited number of sessions at once, shared with Plex or Jellyfin
+  transcodes; Quadro and RTX professional cards don't have that limit.
+
+## NVIDIA GPUs and CUDA
+
+| | |
+|---|---|
+| Host driver | **570.86 or newer** (Nvidia Driver plugin), for Vulkan, GBM and dma-buf sharing |
+| Pascal (GTX 10-series, Quadro P), Maxwell, Volta | Stay on the **R580** driver branch: NVIDIA's newer drivers drop these cards |
+| Turing (RTX 20 / GTX 16) and newer | Any current production driver |
+| RTX 50-series | The open-source driver flavour in the Nvidia Driver plugin |
+
+**CUDA 12, not 13.** Windows itself gets no CUDA (it has no NVIDIA driver,
+only the Triton virtual GPU). CUDA is used inside the container, where
+Sunshine converts and hands frames to the NVENC encoder. It is built with
+CUDA 12.9 because CUDA 13 dropped Maxwell, Pascal and Volta cards, so a
+CUDA 13 build would not stream on a GTX 10-series or Quadro P card. CUDA 12
+code runs on newer cards and drivers too, so nothing is lost on an RTX card.
+The CUDA version on the host doesn't matter; only the driver version does.
+
+## Remote Desktop
 
 - With this repo's driver, programs in an RDP session can use the GPU when
   the policy **Use hardware graphics adapters for all Remote Desktop
@@ -214,8 +288,9 @@ instead of only disconnecting.
 - With the upstream driver, RDP can't use the GPU. Also turn off automatic
   sign-in and sign out of the web console before connecting, or the RDP
   session can end up with a dead taskbar.
-- For game streaming, Sunshine + Moonlight works. Forward TCP
-  47984-47990 and 48010, and UDP 47998-48000.
+- For game streaming, use [Moonlight](#streaming-with-moonlight). Sunshine
+  installed inside Windows works too (with `STREAM=N`), but then Windows
+  captures and encodes the stream on its own CPU cores.
 
 ## Backups
 
@@ -269,7 +344,14 @@ anything is published. Releases are cut by pushing a `vX.Y.Z` git tag. Changes
 are listed in [CHANGELOG.md](CHANGELOG.md).
 
 Updating the container never touches your Windows disk: the image only holds
-QEMU and scripts, and Windows lives in `/storage`.
+QEMU, Sunshine and scripts, and Windows lives in `/storage`.
+
+Sunshine is pinned to one release too. To build the newest Sunshine release
+with WinBox's capture source, open **Actions > Build > Run workflow**, tick
+"Build the newest Sunshine release instead of the pinned one", and run it on
+`main` (publishes `edge`) or on the newest `v…` tag (republishes `latest`).
+If the patch no longer fits the new release, the build fails and the
+published image stays as it was.
 
 ## Storage
 
@@ -336,6 +418,9 @@ The startup hook stops with a clear message when something is missing:
 | `Nvidia GBM driver is missing` / `gbm_create_device failed` | Add the two `/usr/lib64` mounts from step 3 |
 | `modesetting is off` | Step 1.2 above, then reboot |
 | `older than the 570.86 minimum` | Update the driver in the Nvidia Driver plugin |
+| `STREAM=Y needs GPU=Y` | Streaming needs **GPU acceleration** = `Y` |
+| Moonlight finds the host but can't connect | Map all Sunshine ports, TCP and UDP, to the same numbers; check `/var/log/sunshine.log` |
+| No sound in Moonlight | Set **Sound** (`AUDIO`) to `Y` |
 | Game says "software rendering" | Device Manager must show **VirtIO GPU 3D controller** with the Triton driver, and over RDP the GPU policy above must be on |
 | `no completion in 30s, retiring as device-lost` | The GPU stopped answering and Windows reset it. Often memory: see [Memory](#memory) |
 | `Memory allocation failed` / `Failed to import ... dmabuf` (Nvidia) | Don't pass `/dev/udmabuf` into the container; Nvidia can't import it. The warning `open /dev/udmabuf: No such file or directory` is expected and harmless |
@@ -353,8 +438,9 @@ list and set them as template variables.
 
 | Path | What |
 |---|---|
-| `Dockerfile` | Builds the Triton QEMU stack, then `dockurr/windows` (pinned by digest) + the hook, healthcheck and that QEMU |
+| `Dockerfile` | Builds the Triton QEMU stack and Sunshine, then `dockurr/windows` (pinned by digest) + the hook, healthcheck, that QEMU and Sunshine |
 | `qemu-triton/` | Patches for QEMU, virglrenderer and DXVK, see its [README](qemu-triton/README.md) |
+| `sunshine/` | Sunshine patch for streaming from QEMU, see its [README](sunshine/README.md) |
 | `driver/` | Windows guest driver patches and package files, see its [README](driver/README.md) |
 | `src/start.sh` | Unraid startup hook (upstream sources `/run/start.sh` first) |
 | `src/health.sh` | Container healthcheck |
@@ -381,6 +467,9 @@ packages it for Unraid and carries small fixes.
   [osy/dxvk](https://github.com/osy/dxvk),
   [osy/virtio-win-mesa](https://github.com/osy/virtio-win-mesa),
   [osy/kvm-guest-drivers-windows](https://github.com/osy/kvm-guest-drivers-windows)).
+- [Sunshine](https://github.com/LizardByte/Sunshine) by LizardByte and
+  [Moonlight](https://moonlight-stream.org/): game streaming. The
+  container's streaming is Sunshine with one added capture source.
 - [QEMU](https://www.qemu.org/), [virglrenderer](https://gitlab.freedesktop.org/virgl/virglrenderer),
   [DXVK](https://github.com/doitsujin/dxvk) and [Mesa](https://www.mesa3d.org/).
 - The [virtio-win](https://github.com/virtio-win/kvm-guest-drivers-windows)
@@ -391,14 +480,23 @@ these patches here.
 
 ## Legal
 
-- This repository's own files are under the [MIT license](LICENSE). The
+- This repository's own files are under the [MIT license](LICENSE), except
+  the patches to other projects, which are under those projects' licenses
+  (the Sunshine patch in `sunshine/patches` is GPL-3.0, like Sunshine). The
   image and the driver package also contain upstream software under its own
-  licenses, among them QEMU (GPL-2.0), virglrenderer (MIT), DXVK (zlib),
-  Mesa (MIT and others) and the virtio-win drivers (BSD-3-Clause). Their
-  sources are the pinned upstream commits named in the `Dockerfile` and in
-  `.github/workflows/driver.yml`, plus the patches in this repository.
+  licenses, among them QEMU (GPL-2.0), Sunshine (GPL-3.0), virglrenderer
+  (MIT), DXVK (zlib), Mesa (MIT and others) and the virtio-win drivers
+  (BSD-3-Clause). Their sources are the pinned upstream commits named in the
+  `Dockerfile` and in `.github/workflows/driver.yml`, plus the patches in
+  this repository.
+- Sunshine is compiled with NVIDIA's CUDA 12.9 toolkit, as LizardByte's own
+  Linux packages are. The image holds only the compiled Sunshine; the
+  NVIDIA driver, CUDA driver library and NVENC come from the host's driver
+  through the NVIDIA container runtime.
 - The image contains no Windows code; it downloads Windows from Microsoft.
   You need a valid Windows license.
-- Not affiliated with or endorsed by Microsoft, Nvidia, Red Hat, Unraid
-  (Lime Technology) or the upstream projects. Provided as is, without
+- Not affiliated with or endorsed by Microsoft, NVIDIA, Red Hat, Unraid
+  (Lime Technology), LizardByte or the upstream projects. NVIDIA, CUDA and
+  NVENC are trademarks of NVIDIA Corporation, used here only to say what
+  hardware and software this works with. Provided as is, without
   warranty.

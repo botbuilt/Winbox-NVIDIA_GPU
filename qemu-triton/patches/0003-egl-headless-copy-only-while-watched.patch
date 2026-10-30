@@ -1,0 +1,185 @@
+diff --git a/include/ui/console.h b/include/ui/console.h
+index 8e7364c..3ca301a 100644
+--- a/include/ui/console.h
++++ b/include/ui/console.h
+@@ -482,6 +482,7 @@ void vnc_parse(const char *str);
+ int vnc_init_func(void *opaque, QemuOpts *opts, Error **errp);
+ bool vnc_display_reload_certs(const char *id,  Error **errp);
+ bool vnc_display_update(DisplayUpdateOptionsVNC *arg, Error **errp);
++bool vnc_display_idle(void);
+ 
+ /* input.c */
+ int index_from_key(const char *key, size_t key_length);
+diff --git a/ui/egl-headless.c b/ui/egl-headless.c
+index ef5cc02..ea5bef4 100644
+--- a/ui/egl-headless.c
++++ b/ui/egl-headless.c
+@@ -17,13 +17,73 @@ typedef struct egl_dpy {
+     bool y_0_top;
+     uint32_t pos_x;
+     uint32_t pos_y;
++    /*
++     * WinBox: a guest flush only marks the frame dirty; egl_refresh copies
++     * it to the 2D surface once per refresh tick (30 ms), and only while a
++     * VNC client is connected.  The copy ends in a synchronous glReadPixels
++     * of the whole screen on the main thread, which used to run for every
++     * guest frame even with nobody watching the console.
++     */
++    bool dirty;
++    uint32_t dirty_x1, dirty_y1, dirty_x2, dirty_y2;
++    EGLContext flush_ctx;
+ } egl_dpy;
+ 
+ /* ------------------------------------------------------------------ */
+ 
++static void egl_readback(egl_dpy *edpy)
++{
++    EGLContext cur = eglGetCurrentContext();
++
++    edpy->dirty = false;
++    if (!edpy->guest_fb.texture || !edpy->ds || !edpy->flush_ctx) {
++        return;
++    }
++    assert(surface_format(edpy->ds) == PIXMAN_x8r8g8b8);
++
++    /*
++     * Framebuffer objects are not shared between contexts, so use the
++     * context the flush came in on, then give the caller its own back.
++     */
++    if (cur != edpy->flush_ctx &&
++        !eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
++                        edpy->flush_ctx)) {
++        return;
++    }
++
++    if (edpy->cursor_fb.texture) {
++        /* have cursor -> render using textures */
++        egl_texture_blit(edpy->gls, &edpy->blit_fb, &edpy->guest_fb,
++                         !edpy->y_0_top);
++        egl_texture_blend(edpy->gls, &edpy->blit_fb, &edpy->cursor_fb,
++                          !edpy->y_0_top, edpy->pos_x, edpy->pos_y,
++                          1.0, 1.0);
++    } else {
++        /* no cursor -> use simple framebuffer blit */
++        egl_fb_blit(&edpy->blit_fb, &edpy->guest_fb, edpy->y_0_top);
++    }
++
++    egl_fb_read(edpy->ds, &edpy->blit_fb);
++
++    if (cur != edpy->flush_ctx) {
++        eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, cur);
++    }
++
++    dpy_gfx_update(edpy->dcl.con, edpy->dirty_x1, edpy->dirty_y1,
++                   edpy->dirty_x2 - edpy->dirty_x1,
++                   edpy->dirty_y2 - edpy->dirty_y1);
++}
++
+ static void egl_refresh(DisplayChangeListener *dcl)
+ {
++    egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
++
+     graphic_hw_update(dcl->con);
++
++    /* Nobody watching: keep the frame dirty for the next viewer. */
++    if (edpy->dirty && !vnc_display_idle()) {
++        egl_readback(edpy);
++    }
+ }
+ 
+ static void egl_gfx_update(DisplayChangeListener *dcl,
+@@ -37,6 +97,15 @@ static void egl_gfx_switch(DisplayChangeListener *dcl,
+     egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
+ 
+     edpy->ds = new_surface;
++
++    /* A new surface starts blank: copy the whole frame into it. */
++    if (new_surface && edpy->flush_ctx) {
++        edpy->dirty_x1 = 0;
++        edpy->dirty_y1 = 0;
++        edpy->dirty_x2 = surface_width(new_surface);
++        edpy->dirty_y2 = surface_height(new_surface);
++        edpy->dirty = true;
++    }
+ }
+ 
+ static QEMUGLContext egl_create_context(DisplayGLCtx *dgc,
+@@ -148,22 +217,20 @@ static void egl_scanout_flush(DisplayChangeListener *dcl,
+     if (!edpy->guest_fb.texture || !edpy->ds) {
+         return;
+     }
+-    assert(surface_format(edpy->ds) == PIXMAN_x8r8g8b8);
+ 
+-    if (edpy->cursor_fb.texture) {
+-        /* have cursor -> render using textures */
+-        egl_texture_blit(edpy->gls, &edpy->blit_fb, &edpy->guest_fb,
+-                         !edpy->y_0_top);
+-        egl_texture_blend(edpy->gls, &edpy->blit_fb, &edpy->cursor_fb,
+-                          !edpy->y_0_top, edpy->pos_x, edpy->pos_y,
+-                          1.0, 1.0);
++    if (edpy->dirty) {
++        edpy->dirty_x1 = MIN(edpy->dirty_x1, x);
++        edpy->dirty_y1 = MIN(edpy->dirty_y1, y);
++        edpy->dirty_x2 = MAX(edpy->dirty_x2, x + w);
++        edpy->dirty_y2 = MAX(edpy->dirty_y2, y + h);
+     } else {
+-        /* no cursor -> use simple framebuffer blit */
+-        egl_fb_blit(&edpy->blit_fb, &edpy->guest_fb, edpy->y_0_top);
++        edpy->dirty_x1 = x;
++        edpy->dirty_y1 = y;
++        edpy->dirty_x2 = x + w;
++        edpy->dirty_y2 = y + h;
++        edpy->dirty = true;
+     }
+-
+-    egl_fb_read(edpy->ds, &edpy->blit_fb);
+-    dpy_gfx_update(edpy->dcl.con, x, y, w, h);
++    edpy->flush_ctx = eglGetCurrentContext();
+ }
+ 
+ static const DisplayChangeListenerOps egl_ops = {
+diff --git a/ui/vnc-stubs.c b/ui/vnc-stubs.c
+index a96bc86..43b1558 100644
+--- a/ui/vnc-stubs.c
++++ b/ui/vnc-stubs.c
+@@ -2,6 +2,10 @@
+ #include "ui/console.h"
+ #include "qapi/error.h"
+ 
++bool vnc_display_idle(void)
++{
++    return false;
++}
+ int vnc_display_password(const char *id, const char *password)
+ {
+     return -ENODEV;
+diff --git a/ui/vnc.c b/ui/vnc.c
+index 8be6975..2eaf874 100644
+--- a/ui/vnc.c
++++ b/ui/vnc.c
+@@ -585,6 +585,25 @@ VncInfo2List *qmp_query_vnc_servers(Error **errp)
+     return prev;
+ }
+ 
++/*
++ * WinBox: true when VNC displays exist and none has a client, so a GL
++ * display can skip copying frames that nobody will see.
++ */
++bool vnc_display_idle(void)
++{
++    VncDisplay *vd;
++
++    if (QTAILQ_EMPTY(&vnc_displays)) {
++        return false;
++    }
++    QTAILQ_FOREACH(vd, &vnc_displays, next) {
++        if (!QTAILQ_EMPTY(&vd->clients)) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ bool vnc_display_reload_certs(const char *id, Error **errp)
+ {
+     VncDisplay *vd = vnc_display_find(id);
