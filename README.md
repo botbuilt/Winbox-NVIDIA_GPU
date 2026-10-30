@@ -220,10 +220,11 @@ that is what the server can spare. Keep the cap a little below it, and
 `RAM_SIZE` about 8G below the cap. On a 32 GB server with a dozen other
 containers, that is typically `RAM_SIZE=8G` with a `16g` cap.
 
-To see what the helpers use:
+To see what the helpers use (proportional memory, so libraries they share
+are counted once):
 
 ```bash
-ps -eo rss,comm | awk '$2 ~ /^virgl/ {n++; s+=$1} END {print n " helpers, " int(s/1024) " MB"}'
+for p in $(pgrep virgl); do awk '/^Pss:/ {print $2}' /proc/$p/smaps_rollup; done | awk '{s+=$1} END {print NR " helpers, " int(s/1024) " MB"}'
 ```
 
 Fewer helpers: turn off Widgets, Edge "Startup boost" and "Continue running
