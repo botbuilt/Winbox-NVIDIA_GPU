@@ -44,9 +44,10 @@ fi
 SNAPS="$storage/snapshots"
 running=$($DOCKER inspect -f '{{.State.Running}}' "$CONTAINER")
 
-# The VM state: everything in the storage folder except ISOs and snapshots.
+# The VM state: everything in the storage folder except ISOs, snapshots and
+# the Nvidia shader cache (.nvcache, rebuilt on its own).
 stateItems() {
-  find "$1" -mindepth 1 -maxdepth 1 ! -name '*.iso' ! -name snapshots ! -name '*.partial'
+  find "$1" -mindepth 1 -maxdepth 1 ! -name '*.iso' ! -name snapshots ! -name '*.partial' ! -name .nvcache
 }
 
 # Copy-on-write when the filesystem can, else a sparse full copy.

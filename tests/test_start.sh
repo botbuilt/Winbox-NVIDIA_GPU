@@ -267,6 +267,29 @@ expect "a longer TIMEOUT raises the need" "$out" "to 215 or more"
 rm -f "$FAKE/docker.cfg"
 
 
+# --- Renderer defaults --------------------------------------------------------
+
+out=$(env -i PATH="$PATH" UNRAID_HOOK_TEST=Y HOOK_SHADER_CACHE="$FAKE/storage/.nvcache" bash -c 'source "$0"
+  rendererDefaults
+  printf "CACHE=%s SIZE=%s\nDXVK=%s\nARENAS=%s\n" "$__GL_SHADER_DISK_CACHE_PATH" \
+    "$__GL_SHADER_DISK_CACHE_SIZE" "$DXVK_CONFIG" "$MALLOC_ARENA_MAX"' "$HOOK" 2>&1)
+expect "shader cache lives with the Windows disk" "$out" "CACHE=$FAKE/storage/.nvcache SIZE=4294967296"$'\n'
+expect "shader cache folder is created" "$([ -d "$FAKE/storage/.nvcache" ] && echo yes)" "yes"
+expect "fewer shader compiler threads per helper" "$out" "DXVK=dxvk.numCompilerThreads = 2"$'\n'
+expect "fewer malloc arenas" "$out" "ARENAS=2"$'\n'
+
+out=$(env -i PATH="$PATH" UNRAID_HOOK_TEST=Y HOOK_SHADER_CACHE="$FAKE/storage/.nvcache" \
+  __GL_SHADER_DISK_CACHE_PATH=/mine DXVK_CONFIG="dxvk.hud = fps" MALLOC_ARENA_MAX=4 bash -c 'source "$0"
+  rendererDefaults
+  printf "CACHE=%s\nDXVK=%s\nARENAS=%s\n" "$__GL_SHADER_DISK_CACHE_PATH" "$DXVK_CONFIG" "$MALLOC_ARENA_MAX"' "$HOOK" 2>&1)
+expect "template values win" "$out" "CACHE=/mine"$'\n'"DXVK=dxvk.hud = fps"$'\n'"ARENAS=4"$'\n'
+
+out=$(env -i PATH="$PATH" UNRAID_HOOK_TEST=Y HOOK_SHADER_CACHE=/proc/no-such/.nvcache bash -c 'source "$0"
+  rendererDefaults
+  printf "CACHE=%s\n" "${__GL_SHADER_DISK_CACHE_PATH:-unset}"' "$HOOK" 2>&1)
+expect "unwritable cache folder leaves the driver default" "$out" "CACHE=unset"$'\n'
+
+
 # --- Streaming ----------------------------------------------------------------
 
 out=$(runHook STREAM=Y GPU=Y "${NV[@]}")
