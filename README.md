@@ -201,21 +201,28 @@ Three things use host RAM, and only the first is `RAM_SIZE`:
 
 1. Windows itself (`RAM_SIZE`).
 2. The GPU memory window (`VRAM_SIZE`, 4G by default).
-3. One helper process (`virgl_render_server`) for every Windows program
-   that uses the GPU. Windows 11 has 15-25 of those on a normal desktop
+3. One helper process (`virgl-<n>-…`, started by `virgl_render_server`) for
+   every Windows program that uses the GPU. Windows 11 has 15-25 of those on a normal desktop
    (Explorer, Start, Search, Edge and every WebView app), and a Remote
    Desktop session adds its own set.
 
-If they add up to more than the server has, Unraid itself can freeze. The
-template therefore caps the whole container with
+Windows only grows into `RAM_SIZE` as it runs, so a setting that is too big
+works for a while and then fails. If everything adds up to more than the
+server has, Linux kills the biggest process, which is Windows (`dmesg` shows
+`Out of memory: Killed process … (windows)`), or Unraid itself can freeze.
+The template therefore caps the whole container with
 `--memory=16g --memory-swap=16g`. If the cap is hit, only WinBox is killed
 (the log shows `Killed` / "QEMU exited unexpectedly") and Unraid stays up.
-Keep the cap about 8G above `RAM_SIZE`, and below what the server can spare.
+
+To size it, stop WinBox and look at the `available` column of `free -h`:
+that is what the server can spare. Keep the cap a little below it, and
+`RAM_SIZE` about 8G below the cap. On a 32 GB server with a dozen other
+containers, that is typically `RAM_SIZE=8G` with a `16g` cap.
 
 To see what the helpers use:
 
 ```bash
-ps -C virgl_render_server -o rss= | awk '{s+=$1} END {print NR " helpers, " int(s/1024) " MB"}'
+ps -eo rss,comm | awk '$2 ~ /^virgl/ {n++; s+=$1} END {print n " helpers, " int(s/1024) " MB"}'
 ```
 
 Fewer helpers: turn off Widgets, Edge "Startup boost" and "Continue running
@@ -425,6 +432,7 @@ The startup hook stops with a clear message when something is missing:
 | `no completion in 30s, retiring as device-lost` | The GPU stopped answering and Windows reset it. Often memory: see [Memory](#memory) |
 | `Memory allocation failed` / `Failed to import ... dmabuf` (Nvidia) | Don't pass `/dev/udmabuf` into the container; Nvidia can't import it. The warning `open /dev/udmabuf: No such file or directory` is expected and harmless |
 | `Killed` / `QEMU exited unexpectedly` | The container hit its `--memory` cap; see [Memory](#memory) |
+| Container stops after a while; `dmesg` shows `Out of memory: Killed process … (windows)` | Unraid ran out of RAM. Lower `RAM_SIZE` and the cap; see [Memory](#memory) |
 | `KVM acceleration is not available` | Turn on VT-x/AMD-V in the BIOS |
 | `PASSWORD is empty or a well-known default` | Set a real password in the template |
 | Container shows **unhealthy** | QEMU stopped or the web console is down; check the log |
