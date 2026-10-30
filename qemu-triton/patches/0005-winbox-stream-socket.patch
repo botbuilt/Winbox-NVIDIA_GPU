@@ -1,0 +1,753 @@
+diff --git a/include/ui/winbox-stream.h b/include/ui/winbox-stream.h
+new file mode 100644
+index 0000000..b964341
+--- /dev/null
++++ b/include/ui/winbox-stream.h
+@@ -0,0 +1,119 @@
++/*
++ * WinBox stream socket: hands the guest's scanout to a host-side streamer
++ * (Sunshine) and takes its keyboard and mouse input.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef UI_WINBOX_STREAM_H
++#define UI_WINBOX_STREAM_H
++
++#include "ui/console.h"
++
++/*
++ * Wire protocol.  The socket is AF_UNIX SOCK_SEQPACKET, so every message
++ * arrives whole: a WbsHeader, then `size` bytes of payload.  All fields are
++ * host-endian.  WBS_SCANOUT carries the scanout's dmabuf as SCM_RIGHTS.
++ */
++#define WBS_VERSION 1
++
++enum {
++    /* QEMU -> client */
++    WBS_HELLO = 1,      /* WbsHello */
++    WBS_SCANOUT = 2,    /* WbsScanout + dmabuf fd */
++    WBS_DISABLE = 3,    /* no payload: nothing is scanned out */
++    WBS_FRAME = 4,      /* WbsFrame: the guest flushed the scanout */
++    WBS_CURSOR = 5,     /* WbsCursor + width * height ARGB8888 pixels */
++    WBS_MOUSE = 6,      /* WbsMouse */
++
++    /* client -> QEMU */
++    WBS_KEY = 16,       /* WbsKey */
++    WBS_ABS = 17,       /* WbsAbs */
++    WBS_REL = 18,       /* WbsRel */
++    WBS_BUTTON = 19,    /* WbsButton */
++    WBS_WHEEL = 20,     /* WbsWheel */
++};
++
++typedef struct WbsHeader {
++    uint32_t type;
++    uint32_t size;
++} WbsHeader;
++
++typedef struct WbsHello {
++    uint32_t version;
++} WbsHello;
++
++typedef struct WbsScanout {
++    uint32_t width;     /* buffer size */
++    uint32_t height;
++    uint32_t stride;
++    uint32_t fourcc;    /* DRM format */
++    uint64_t modifier;  /* DRM format modifier */
++    uint32_t x;         /* visible rectangle in the buffer */
++    uint32_t y;
++    uint32_t w;
++    uint32_t h;
++    uint32_t y0_top;
++    uint32_t serial;    /* changes with every scanout */
++} WbsScanout;
++
++typedef struct WbsFrame {
++    uint32_t serial;    /* scanout the flush was for */
++    uint32_t seq;
++} WbsFrame;
++
++typedef struct WbsCursor {
++    uint32_t width;
++    uint32_t height;
++    int32_t hot_x;
++    int32_t hot_y;
++} WbsCursor;
++
++typedef struct WbsMouse {
++    int32_t x;          /* hotspot position */
++    int32_t y;
++    uint32_t visible;
++} WbsMouse;
++
++#define WBS_KEY_DOWN     1u
++#define WBS_KEY_EXTENDED 2u
++
++typedef struct WbsKey {
++    uint32_t vk;        /* Windows virtual-key code */
++    uint32_t flags;     /* WBS_KEY_* */
++} WbsKey;
++
++#define WBS_ABS_MAX 0x7fff
++
++typedef struct WbsAbs {
++    uint32_t x;         /* 0 .. WBS_ABS_MAX across the screen */
++    uint32_t y;
++} WbsAbs;
++
++typedef struct WbsRel {
++    int32_t dx;
++    int32_t dy;
++} WbsRel;
++
++typedef struct WbsButton {
++    uint32_t button;    /* 1 left, 2 middle, 3 right, 4 back, 5 forward */
++    uint32_t down;
++} WbsButton;
++
++typedef struct WbsWheel {
++    int32_t dy;         /* notches, positive scrolls up */
++    int32_t dx;         /* notches, positive scrolls right */
++} WbsWheel;
++
++void wbs_init(QemuConsole *con);
++void wbs_scanout_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf);
++void wbs_scanout_texture(QemuConsole *con, uint32_t tex_id, bool y0_top,
++                         uint32_t width, uint32_t height,
++                         uint32_t x, uint32_t y, uint32_t w, uint32_t h);
++void wbs_scanout_disable(QemuConsole *con);
++void wbs_release_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf);
++void wbs_flush(QemuConsole *con);
++void wbs_cursor_define(QemuConsole *con, QEMUCursor *cursor);
++void wbs_mouse_set(QemuConsole *con, int x, int y, bool on);
++
++#endif
+diff --git a/ui/egl-headless.c b/ui/egl-headless.c
+index ea5bef4..7dd3e5b 100644
+--- a/ui/egl-headless.c
++++ b/ui/egl-headless.c
+@@ -6,6 +6,7 @@
+ #include "ui/egl-helpers.h"
+ #include "ui/egl-context.h"
+ #include "ui/shader.h"
++#include "ui/winbox-stream.h"
+ 
+ typedef struct egl_dpy {
+     DisplayChangeListener dcl;
+@@ -120,6 +121,7 @@ static void egl_scanout_disable(DisplayChangeListener *dcl)
+ {
+     egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
+ 
++    wbs_scanout_disable(dcl->con);
+     egl_fb_destroy(&edpy->guest_fb);
+     egl_fb_destroy(&edpy->blit_fb);
+ }
+@@ -149,6 +151,21 @@ static void egl_scanout_texture(DisplayChangeListener *dcl,
+     }
+ }
+ 
++static void egl_scanout_texture_cb(DisplayChangeListener *dcl,
++                                   uint32_t backing_id,
++                                   bool backing_y_0_top,
++                                   uint32_t backing_width,
++                                   uint32_t backing_height,
++                                   uint32_t x, uint32_t y,
++                                   uint32_t w, uint32_t h,
++                                   ScanoutTextureNative native)
++{
++    egl_scanout_texture(dcl, backing_id, backing_y_0_top,
++                        backing_width, backing_height, x, y, w, h, native);
++    wbs_scanout_texture(dcl->con, backing_id, backing_y_0_top,
++                        backing_width, backing_height, x, y, w, h);
++}
++
+ #ifdef CONFIG_GBM
+ 
+ static void egl_scanout_dmabuf(DisplayChangeListener *dcl,
+@@ -156,6 +173,8 @@ static void egl_scanout_dmabuf(DisplayChangeListener *dcl,
+ {
+     uint32_t width, height, texture;
+ 
++    wbs_scanout_dmabuf(dcl->con, dmabuf);
++
+     egl_dmabuf_import_texture(dmabuf);
+     texture = qemu_dmabuf_get_texture(dmabuf);
+     if (!texture) {
+@@ -194,11 +213,22 @@ static void egl_cursor_dmabuf(DisplayChangeListener *dcl,
+ static void egl_release_dmabuf(DisplayChangeListener *dcl,
+                                QemuDmaBuf *dmabuf)
+ {
++    wbs_release_dmabuf(dcl->con, dmabuf);
+     egl_dmabuf_release_texture(dmabuf);
+ }
+ 
+ #endif
+ 
++static void egl_mouse_set(DisplayChangeListener *dcl, int x, int y, bool on)
++{
++    wbs_mouse_set(dcl->con, x, y, on);
++}
++
++static void egl_cursor_define(DisplayChangeListener *dcl, QEMUCursor *cursor)
++{
++    wbs_cursor_define(dcl->con, cursor);
++}
++
+ static void egl_cursor_position(DisplayChangeListener *dcl,
+                                 uint32_t pos_x, uint32_t pos_y)
+ {
+@@ -214,6 +244,8 @@ static void egl_scanout_flush(DisplayChangeListener *dcl,
+ {
+     egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
+ 
++    wbs_flush(dcl->con);
++
+     if (!edpy->guest_fb.texture || !edpy->ds) {
+         return;
+     }
+@@ -239,8 +271,11 @@ static const DisplayChangeListenerOps egl_ops = {
+     .dpy_gfx_update          = egl_gfx_update,
+     .dpy_gfx_switch          = egl_gfx_switch,
+ 
++    .dpy_mouse_set           = egl_mouse_set,
++    .dpy_cursor_define       = egl_cursor_define,
++
+     .dpy_gl_scanout_disable  = egl_scanout_disable,
+-    .dpy_gl_scanout_texture  = egl_scanout_texture,
++    .dpy_gl_scanout_texture  = egl_scanout_texture_cb,
+ #ifdef CONFIG_GBM
+     .dpy_gl_scanout_dmabuf   = egl_scanout_dmabuf,
+     .dpy_gl_cursor_dmabuf    = egl_cursor_dmabuf,
+@@ -305,6 +340,9 @@ static void egl_headless_init(DisplayState *ds, DisplayOptions *opts)
+         ctx->ops = &eglctx_ops;
+         qemu_console_set_display_gl_ctx(con, ctx);
+         register_displaychangelistener(&edpy->dcl);
++        if (idx == 0) {
++            wbs_init(con);
++        }
+     }
+ }
+ 
+diff --git a/ui/meson.build b/ui/meson.build
+index 10eea7e..925552d 100644
+--- a/ui/meson.build
++++ b/ui/meson.build
+@@ -71,7 +71,7 @@ endif
+ if opengl.found()
+   egl_headless_ss = ss.source_set()
+   egl_headless_ss.add(when: [egl, opengl, gbm, pixman],
+-                      if_true: files('egl-headless.c'))
++                      if_true: files('egl-headless.c', 'winbox-stream.c'))
+   ui_modules += {'egl-headless' : egl_headless_ss}
+ endif
+ 
+diff --git a/ui/winbox-stream.c b/ui/winbox-stream.c
+new file mode 100644
+index 0000000..63ddc87
+--- /dev/null
++++ b/ui/winbox-stream.c
+@@ -0,0 +1,503 @@
++/*
++ * WinBox stream socket: hands the guest's scanout to a host-side streamer
++ * (Sunshine) and takes its keyboard and mouse input.
++ *
++ * With WINBOX_STREAM_SOCKET set, the first console of the egl-headless
++ * display listens on that unix socket for one client; a new client replaces
++ * the old one.  The client gets the scanout dmabuf, a notice per guest flush
++ * and the hardware cursor, so it can encode the screen on the host GPU
++ * without a copy through RAM.  Every send is non-blocking: a client that
++ * falls behind loses notices, it never stalls the main loop.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include <sys/socket.h>
++#include <sys/un.h>
++#include "qemu/cutils.h"
++#include "qemu/error-report.h"
++#include "qemu/main-loop.h"
++#include "ui/console.h"
++#include "ui/input.h"
++#include "ui/egl-helpers.h"
++#include "ui/winbox-stream.h"
++
++typedef struct WinboxStream {
++    QemuConsole *con;
++    int listen_fd;
++    int client_fd;
++
++    /* Current scanout: a dmabuf, an exported GL texture, or nothing. */
++    QemuDmaBuf *dmabuf;
++    bool texture;
++    bool texture_pending;   /* export at the next flush */
++    uint32_t tex_id;
++    int tex_fd;
++    WbsScanout tex_info;
++    uint32_t serial;
++    uint32_t seq;
++    bool resend;            /* the last scanout message was dropped */
++
++    QEMUCursor *cursor;
++    WbsMouse mouse;
++} WinboxStream;
++
++static WinboxStream *wbs;
++
++static WinboxStream *wbs_for(QemuConsole *con)
++{
++    return wbs && wbs->con == con ? wbs : NULL;
++}
++
++static void wbs_drop_client(WinboxStream *s)
++{
++    if (s->client_fd < 0) {
++        return;
++    }
++    qemu_set_fd_handler(s->client_fd, NULL, NULL, NULL);
++    close(s->client_fd);
++    s->client_fd = -1;
++    info_report("winbox stream: client disconnected");
++}
++
++static bool wbs_send(WinboxStream *s, uint32_t type,
++                     const void *data, size_t size,
++                     const void *extra, size_t extra_size, int fd)
++{
++    WbsHeader hdr = { .type = type, .size = size + extra_size };
++    struct iovec iov[3] = {
++        { .iov_base = &hdr, .iov_len = sizeof(hdr) },
++        { .iov_base = (void *)data, .iov_len = size },
++        { .iov_base = (void *)extra, .iov_len = extra_size },
++    };
++    struct msghdr msg = { .msg_iov = iov, .msg_iovlen = ARRAY_SIZE(iov) };
++    char control[CMSG_SPACE(sizeof(int))];
++    ssize_t ret;
++
++    if (s->client_fd < 0) {
++        return false;
++    }
++
++    if (fd >= 0) {
++        struct cmsghdr *cmsg;
++
++        memset(control, 0, sizeof(control));
++        msg.msg_control = control;
++        msg.msg_controllen = sizeof(control);
++        cmsg = CMSG_FIRSTHDR(&msg);
++        cmsg->cmsg_level = SOL_SOCKET;
++        cmsg->cmsg_type = SCM_RIGHTS;
++        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
++        memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
++    }
++
++    do {
++        ret = sendmsg(s->client_fd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
++    } while (ret < 0 && errno == EINTR);
++
++    if (ret < 0) {
++        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOBUFS) {
++            wbs_drop_client(s);
++        }
++        return false;
++    }
++    return true;
++}
++
++static void wbs_send_scanout(WinboxStream *s)
++{
++    WbsScanout info = { 0 };
++    int fd = -1;
++
++    if (s->dmabuf) {
++        info.width = qemu_dmabuf_get_backing_width(s->dmabuf);
++        info.height = qemu_dmabuf_get_backing_height(s->dmabuf);
++        info.stride = qemu_dmabuf_get_stride(s->dmabuf);
++        info.fourcc = qemu_dmabuf_get_fourcc(s->dmabuf);
++        info.modifier = qemu_dmabuf_get_modifier(s->dmabuf);
++        info.x = qemu_dmabuf_get_x(s->dmabuf);
++        info.y = qemu_dmabuf_get_y(s->dmabuf);
++        info.w = qemu_dmabuf_get_width(s->dmabuf);
++        info.h = qemu_dmabuf_get_height(s->dmabuf);
++        info.y0_top = qemu_dmabuf_get_y0_top(s->dmabuf);
++        fd = qemu_dmabuf_get_fd(s->dmabuf);
++    } else if (s->texture && s->tex_fd >= 0) {
++        info = s->tex_info;
++        fd = s->tex_fd;
++    }
++    info.serial = s->serial;
++
++    if (fd < 0) {
++        s->resend = !wbs_send(s, WBS_DISABLE, NULL, 0, NULL, 0, -1);
++    } else {
++        s->resend = !wbs_send(s, WBS_SCANOUT, &info, sizeof(info),
++                              NULL, 0, fd);
++    }
++}
++
++static void wbs_send_cursor(WinboxStream *s)
++{
++    WbsCursor info;
++
++    if (!s->cursor) {
++        return;
++    }
++    info.width = s->cursor->width;
++    info.height = s->cursor->height;
++    info.hot_x = s->cursor->hot_x;
++    info.hot_y = s->cursor->hot_y;
++    wbs_send(s, WBS_CURSOR, &info, sizeof(info), s->cursor->data,
++             (size_t)info.width * info.height * sizeof(uint32_t), -1);
++}
++
++static void wbs_clear_texture(WinboxStream *s)
++{
++    if (s->tex_fd >= 0) {
++        close(s->tex_fd);
++        s->tex_fd = -1;
++    }
++    s->texture = false;
++    s->texture_pending = false;
++}
++
++/* ------------------------------------------------------------------ */
++/* Input from the client                                              */
++
++static void wbs_key(WinboxStream *s, const WbsKey *key)
++{
++    QKeyCode qcode = Q_KEY_CODE_UNMAPPED;
++
++    /* Keypad Enter shares VK_RETURN and differs only in the extended bit. */
++    if (key->vk == 0x0d && (key->flags & WBS_KEY_EXTENDED)) {
++        qcode = Q_KEY_CODE_KP_ENTER;
++    } else if (key->vk < qemu_input_map_win32_to_qcode_len) {
++        qcode = qemu_input_map_win32_to_qcode[key->vk];
++    }
++    if (qcode != Q_KEY_CODE_UNMAPPED) {
++        qemu_input_event_send_key_qcode(s->con, qcode,
++                                        key->flags & WBS_KEY_DOWN);
++    }
++}
++
++static void wbs_button(WinboxStream *s, InputButton btn, bool down)
++{
++    qemu_input_queue_btn(s->con, btn, down);
++    qemu_input_event_sync();
++}
++
++static void wbs_wheel_axis(WinboxStream *s, int notches,
++                           InputButton positive, InputButton negative)
++{
++    InputButton btn = notches > 0 ? positive : negative;
++    int i, n = MIN(abs(notches), 16);
++
++    for (i = 0; i < n; i++) {
++        wbs_button(s, btn, true);
++        wbs_button(s, btn, false);
++    }
++}
++
++static void wbs_handle(WinboxStream *s, const uint8_t *buf, size_t len)
++{
++    static const InputButton buttons[] = {
++        INPUT_BUTTON_LEFT, INPUT_BUTTON_MIDDLE, INPUT_BUTTON_RIGHT,
++        INPUT_BUTTON_SIDE, INPUT_BUTTON_EXTRA,
++    };
++    WbsHeader hdr;
++    const uint8_t *p = buf + sizeof(hdr);
++
++    if (len < sizeof(hdr)) {
++        return;
++    }
++    memcpy(&hdr, buf, sizeof(hdr));
++    if (hdr.size > len - sizeof(hdr)) {
++        return;
++    }
++
++    switch (hdr.type) {
++    case WBS_KEY: {
++        WbsKey key;
++
++        if (hdr.size >= sizeof(key)) {
++            memcpy(&key, p, sizeof(key));
++            wbs_key(s, &key);
++        }
++        break;
++    }
++    case WBS_ABS: {
++        WbsAbs abs;
++
++        if (hdr.size >= sizeof(abs)) {
++            memcpy(&abs, p, sizeof(abs));
++            qemu_input_queue_abs(s->con, INPUT_AXIS_X,
++                                 MIN(abs.x, WBS_ABS_MAX), 0, WBS_ABS_MAX);
++            qemu_input_queue_abs(s->con, INPUT_AXIS_Y,
++                                 MIN(abs.y, WBS_ABS_MAX), 0, WBS_ABS_MAX);
++            qemu_input_event_sync();
++        }
++        break;
++    }
++    case WBS_REL: {
++        WbsRel rel;
++
++        if (hdr.size >= sizeof(rel)) {
++            memcpy(&rel, p, sizeof(rel));
++            qemu_input_queue_rel(s->con, INPUT_AXIS_X, rel.dx);
++            qemu_input_queue_rel(s->con, INPUT_AXIS_Y, rel.dy);
++            qemu_input_event_sync();
++        }
++        break;
++    }
++    case WBS_BUTTON: {
++        WbsButton b;
++
++        if (hdr.size >= sizeof(b)) {
++            memcpy(&b, p, sizeof(b));
++            if (b.button >= 1 && b.button <= ARRAY_SIZE(buttons)) {
++                wbs_button(s, buttons[b.button - 1], b.down);
++            }
++        }
++        break;
++    }
++    case WBS_WHEEL: {
++        WbsWheel w;
++
++        if (hdr.size >= sizeof(w)) {
++            memcpy(&w, p, sizeof(w));
++            wbs_wheel_axis(s, w.dy, INPUT_BUTTON_WHEEL_UP,
++                           INPUT_BUTTON_WHEEL_DOWN);
++            wbs_wheel_axis(s, w.dx, INPUT_BUTTON_WHEEL_RIGHT,
++                           INPUT_BUTTON_WHEEL_LEFT);
++        }
++        break;
++    }
++    default:
++        break;
++    }
++}
++
++static void wbs_client_read(void *opaque)
++{
++    WinboxStream *s = opaque;
++    uint8_t buf[256];
++    ssize_t n;
++
++    while (s->client_fd >= 0) {
++        n = recv(s->client_fd, buf, sizeof(buf), MSG_DONTWAIT);
++        if (n < 0 && errno == EINTR) {
++            continue;
++        }
++        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++            return;
++        }
++        if (n <= 0) {
++            wbs_drop_client(s);
++            return;
++        }
++        wbs_handle(s, buf, n);
++    }
++}
++
++static void wbs_accept(void *opaque)
++{
++    WinboxStream *s = opaque;
++    WbsHello hello = { .version = WBS_VERSION };
++    int sndbuf = 1 << 20;
++    int fd;
++
++    fd = accept4(s->listen_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
++    if (fd < 0) {
++        return;
++    }
++
++    /* The newest client wins: a restarted streamer replaces a stale one. */
++    wbs_drop_client(s);
++    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
++    s->client_fd = fd;
++    qemu_set_fd_handler(fd, wbs_client_read, NULL, s);
++    info_report("winbox stream: client connected");
++
++    wbs_send(s, WBS_HELLO, &hello, sizeof(hello), NULL, 0, -1);
++    if (s->texture) {
++        /* The texture can only be exported where the guest's GL context
++         * is current, which is at the next flush. */
++        s->texture_pending = true;
++    } else {
++        wbs_send_scanout(s);
++    }
++    wbs_send_cursor(s);
++    wbs_send(s, WBS_MOUSE, &s->mouse, sizeof(s->mouse), NULL, 0, -1);
++}
++
++/* ------------------------------------------------------------------ */
++/* Display hooks, called by egl-headless on the main loop              */
++
++void wbs_init(QemuConsole *con)
++{
++    const char *path = getenv("WINBOX_STREAM_SOCKET");
++    struct sockaddr_un addr = { .sun_family = AF_UNIX };
++    WinboxStream *s;
++    int fd;
++
++    if (wbs || !path || !*path) {
++        return;
++    }
++    if (strlen(path) >= sizeof(addr.sun_path)) {
++        error_report("winbox stream: socket path too long: %s", path);
++        return;
++    }
++    pstrcpy(addr.sun_path, sizeof(addr.sun_path), path);
++
++    fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
++    if (fd < 0) {
++        error_report("winbox stream: socket: %s", strerror(errno));
++        return;
++    }
++    unlink(path);
++    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
++        listen(fd, 2) < 0) {
++        error_report("winbox stream: %s: %s", path, strerror(errno));
++        close(fd);
++        return;
++    }
++    chmod(path, 0600);
++
++    s = g_new0(WinboxStream, 1);
++    s->con = con;
++    s->listen_fd = fd;
++    s->client_fd = -1;
++    s->tex_fd = -1;
++    qemu_set_fd_handler(fd, wbs_accept, NULL, s);
++    wbs = s;
++    info_report("winbox stream: listening on %s", path);
++}
++
++void wbs_scanout_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf)
++{
++    WinboxStream *s = wbs_for(con);
++
++    if (!s || s->dmabuf == dmabuf) {
++        return;
++    }
++    wbs_clear_texture(s);
++    s->dmabuf = dmabuf;
++    s->serial++;
++    wbs_send_scanout(s);
++}
++
++void wbs_scanout_texture(QemuConsole *con, uint32_t tex_id, bool y0_top,
++                         uint32_t width, uint32_t height,
++                         uint32_t x, uint32_t y, uint32_t w, uint32_t h)
++{
++    WinboxStream *s = wbs_for(con);
++
++    if (!s) {
++        return;
++    }
++    /* A guest that re-sets the same texture keeps its export. */
++    if (s->texture && s->tex_id == tex_id &&
++        s->tex_info.width == width && s->tex_info.height == height &&
++        s->tex_info.x == x && s->tex_info.y == y &&
++        s->tex_info.w == w && s->tex_info.h == h) {
++        return;
++    }
++    wbs_clear_texture(s);
++    s->dmabuf = NULL;
++    s->texture = true;
++    s->texture_pending = true;
++    s->tex_id = tex_id;
++    s->tex_info = (WbsScanout) {
++        .width = width, .height = height,
++        .x = x, .y = y, .w = w, .h = h,
++        .y0_top = y0_top,
++    };
++    s->serial++;
++}
++
++void wbs_scanout_disable(QemuConsole *con)
++{
++    WinboxStream *s = wbs_for(con);
++
++    if (!s) {
++        return;
++    }
++    wbs_clear_texture(s);
++    s->dmabuf = NULL;
++    s->serial++;
++    wbs_send_scanout(s);
++}
++
++void wbs_release_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf)
++{
++    WinboxStream *s = wbs_for(con);
++
++    /* The next scanout, or a disable, always follows. */
++    if (s && s->dmabuf == dmabuf) {
++        s->dmabuf = NULL;
++    }
++}
++
++void wbs_flush(QemuConsole *con)
++{
++    WinboxStream *s = wbs_for(con);
++    WbsFrame frame;
++
++    if (!s || s->client_fd < 0) {
++        return;
++    }
++
++#ifdef CONFIG_GBM
++    if (s->texture && s->texture_pending) {
++        EGLint stride, fourcc;
++        EGLuint64KHR modifier;
++
++        s->texture_pending = false;
++        if (s->tex_fd < 0) {
++            s->tex_fd = egl_get_fd_for_texture(s->tex_id, &stride, &fourcc,
++                                               &modifier);
++            s->tex_info.stride = stride;
++            s->tex_info.fourcc = fourcc;
++            s->tex_info.modifier = modifier;
++        }
++        s->resend = true;
++    }
++#endif
++
++    if (s->resend) {
++        wbs_send_scanout(s);
++    }
++    frame.serial = s->serial;
++    frame.seq = ++s->seq;
++    wbs_send(s, WBS_FRAME, &frame, sizeof(frame), NULL, 0, -1);
++}
++
++void wbs_cursor_define(QemuConsole *con, QEMUCursor *cursor)
++{
++    WinboxStream *s = wbs_for(con);
++
++    if (!s) {
++        return;
++    }
++    if (cursor) {
++        cursor_ref(cursor);
++    }
++    if (s->cursor) {
++        cursor_unref(s->cursor);
++    }
++    s->cursor = cursor;
++    wbs_send_cursor(s);
++}
++
++void wbs_mouse_set(QemuConsole *con, int x, int y, bool on)
++{
++    WinboxStream *s = wbs_for(con);
++
++    if (!s) {
++        return;
++    }
++    s->mouse.x = x;
++    s->mouse.y = y;
++    s->mouse.visible = on;
++    wbs_send(s, WBS_MOUSE, &s->mouse, sizeof(s->mouse), NULL, 0, -1);
++}

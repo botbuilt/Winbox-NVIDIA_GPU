@@ -6,13 +6,18 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      newest_sunshine:
+        description: "Build the newest Sunshine release instead of the pinned one"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 env:
   # ghcr needs a lowercase owner; set again per job from github.repository_owner.
-  IMAGE_NAME: winbox-triton
+  IMAGE_NAME: winbox-nvidia-gpu
 
 jobs:
   test:
@@ -35,11 +40,26 @@ jobs:
   boot-test:
     needs: test
     runs-on: ubuntu-latest
-    # The first build compiles QEMU, virglrenderer and DXVK (about 1-2 hours);
-    # later builds reuse the GitHub Actions cache.
+    # The first build compiles QEMU, virglrenderer, DXVK and Sunshine (about
+    # 2 hours); later builds reuse the GitHub Actions cache.
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Pick the Sunshine release
+        id: sunshine
+        env:
+          NEWEST: ${{ inputs.newest_sunshine }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$NEWEST" = "true" ]; then
+            tag=$(gh api repos/LizardByte/Sunshine/releases/latest --jq .tag_name)
+            echo "Building the newest Sunshine release: $tag"
+            echo "build_args=SUNSHINE_REF=$tag" >> "$GITHUB_OUTPUT"
+          else
+            echo "Building the pinned Sunshine (SUNSHINE_REF in the Dockerfile)"
+          fi
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
@@ -52,6 +72,7 @@ jobs:
           context: .
           load: true
           tags: winbox:ci
+          build-args: ${{ steps.sunshine.outputs.build_args }}
           cache-from: type=gha,scope=winbox
           cache-to: type=gha,mode=max,scope=winbox
       - name: Refuses a default password
@@ -97,6 +118,18 @@ jobs:
       security-events: write     # Trivy results in the Security tab
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Pick the Sunshine release
+        id: sunshine
+        env:
+          NEWEST: ${{ inputs.newest_sunshine }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$NEWEST" = "true" ]; then
+            tag=$(gh api repos/LizardByte/Sunshine/releases/latest --jq .tag_name)
+            echo "build_args=SUNSHINE_REF=$tag" >> "$GITHUB_OUTPUT"
+          fi
       - name: Image name
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -124,6 +157,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ steps.sunshine.outputs.build_args }}
           sbom: true
           provenance: mode=max
           cache-from: type=gha,scope=winbox

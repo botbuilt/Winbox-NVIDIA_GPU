@@ -1,18 +1,18 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>WinBox</Name>
-  <Repository>ghcr.io/botbuilt/winbox-triton:latest</Repository>
-  <Registry>https://github.com/botbuilt/Winbox-triton-driver/pkgs/container/winbox-triton</Registry>
+  <Repository>ghcr.io/botbuilt/winbox-nvidia-gpu:latest</Repository>
+  <Registry>https://github.com/botbuilt/Winbox-NVIDIA_GPU/pkgs/container/winbox-nvidia-gpu</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>bash</Shell>
   <Privileged>false</Privileged>
-  <Support>https://github.com/botbuilt/Winbox-triton-driver/issues</Support>
-  <Project>https://github.com/botbuilt/Winbox-triton-driver</Project>
-  <Overview>Windows 10/11 (or Server) running in a QEMU/KVM virtual machine inside a container. Installs itself automatically on first start; watch progress in the WebUI. Supports persistent storage on your array or cache, an Unraid share mapped as drive Z:, DirectX 11 on a GPU that stays shared with Unraid and other containers, through the experimental Triton driver (tested on Nvidia), optional dedicated VFIO passthrough, and USB passthrough. Defaults are set up for a shared Nvidia GPU; see the project README for setup.</Overview>
+  <Support>https://github.com/botbuilt/Winbox-NVIDIA_GPU/issues</Support>
+  <Project>https://github.com/botbuilt/Winbox-NVIDIA_GPU</Project>
+  <Overview>Windows in a box with an NVIDIA GPU: Windows 10/11 (or Server) in a QEMU/KVM virtual machine inside a container, using an NVIDIA card that stays shared with Unraid and your other containers (Plex, Jellyfin, AI apps). Windows gets DirectX 11 on the GPU through the experimental Triton driver, and Moonlight streaming with the video encoded on the GPU (Sunshine with NVENC, CUDA 12) inside the container. Installs itself automatically on first start; watch progress in the WebUI. Also: persistent storage on your array or cache, an Unraid share as drive Z:, optional dedicated VFIO passthrough, and USB passthrough. See the project README for setup.</Overview>
   <Category>Tools: Productivity:</Category>
   <WebUI>http://[IP]:[PORT:8006]/</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/botbuilt/Winbox-triton-driver/main/unraid/winbox.xml</TemplateURL>
+  <TemplateURL>https://raw.githubusercontent.com/botbuilt/Winbox-NVIDIA_GPU/main/unraid/winbox.xml</TemplateURL>
   <Icon>https://raw.githubusercontent.com/dockur/windows/master/.github/logo.png</Icon>
   <ExtraParams>--runtime=nvidia --device=/dev/dri --cap-add=NET_ADMIN --stop-timeout=120 --memory=16g --memory-swap=16g -v /usr/lib64/libnvidia-allocator.so.1:/run/nvidia-host/libnvidia-allocator.so.1:ro -v /usr/lib64/libnvidia-egl-gbm.so.1:/run/nvidia-host/libnvidia-egl-gbm.so.1:ro</ExtraParams>
   <PostArgs/>
@@ -58,6 +58,16 @@
   <Config Name="GPU memory budget" Target="VRAM_SIZE" Default="4G" Mode="" Description="Video memory Windows may use on the shared GPU, as a power of two (2G, 4G, 8G). Leave room for the other containers." Type="Variable" Display="advanced" Required="false" Mask="false">4G</Config>
   <Config Name="Render node" Target="RENDERNODE" Default="" Mode="" Description="Optional. Picked automatically, preferring the Nvidia card. Set it, for example /dev/dri/renderD128, to choose a specific GPU." Type="Variable" Display="advanced" Required="false" Mask="false"/>
 
+  <!-- Moonlight streaming: Sunshine in the container, video encoded on the shared GPU (NVENC) -->
+  <Config Name="Moonlight streaming" Target="STREAM" Default="N|Y" Mode="" Description="Y = Sunshine in the container streams Windows to Moonlight, with the video encoded on the shared NVIDIA GPU (NVENC) instead of on Windows' CPU cores. Needs GPU acceleration = Y. Pair Moonlight in Sunshine's web UI (port 47990, same login as the web console). Don't also run Sunshine inside Windows." Type="Variable" Display="always" Required="false" Mask="false">N</Config>
+  <Config Name="Sunshine web UI" Target="47990" Default="47990" Mode="tcp" Description="Sunshine's settings page, for pairing Moonlight: https://[unraid-ip]:47990" Type="Port" Display="advanced" Required="false" Mask="false">47990</Config>
+  <Config Name="Sunshine HTTPS" Target="47984" Default="47984" Mode="tcp" Description="Moonlight streaming (pairing and control)." Type="Port" Display="advanced" Required="false" Mask="false">47984</Config>
+  <Config Name="Sunshine HTTP" Target="47989" Default="47989" Mode="tcp" Description="Moonlight streaming (finding the host)." Type="Port" Display="advanced" Required="false" Mask="false">47989</Config>
+  <Config Name="Sunshine RTSP" Target="48010" Default="48010" Mode="tcp" Description="Moonlight streaming (session setup)." Type="Port" Display="advanced" Required="false" Mask="false">48010</Config>
+  <Config Name="Sunshine video" Target="47998" Default="47998" Mode="udp" Description="Moonlight streaming (video)." Type="Port" Display="advanced" Required="false" Mask="false">47998</Config>
+  <Config Name="Sunshine control" Target="47999" Default="47999" Mode="udp" Description="Moonlight streaming (control)." Type="Port" Display="advanced" Required="false" Mask="false">47999</Config>
+  <Config Name="Sunshine audio" Target="48000" Default="48000" Mode="udp" Description="Moonlight streaming (audio)." Type="Port" Display="advanced" Required="false" Mask="false">48000</Config>
+
   <!-- Alternative: dedicated passthrough (VFIO). Takes the GPU away from Unraid; set GPU=N when using it. -->
   <Config Name="GPU passthrough" Target="GPU_PASSTHROUGH" Default="" Mode="" Description="Alternative to shared mode: the GPU is taken away from Unraid and every other container while Windows runs. Set GPU acceleration to N. PCI address from Tools &gt; System Devices, for example 01:00.0. The GPU's audio function is added automatically. Bind it to VFIO first, then add --device=/dev/vfio/vfio --device=/dev/vfio/N (N = its IOMMU group) to Extra Parameters." Type="Variable" Display="advanced" Required="false" Mask="false"/>
   <Config Name="GPU is primary display" Target="GPU_PRIMARY" Default="N|Y" Mode="" Description="Y = Windows uses only the passed-through GPU (plug a monitor or dummy plug into it). Turns off the web console; use RDP, Parsec or Sunshine. N = keep the web console as a second display." Type="Variable" Display="advanced" Required="false" Mask="false">N</Config>
@@ -70,6 +80,6 @@
   <Config Name="USB passthrough" Target="USB_PASSTHROUGH" Default="" Mode="" Description="Optional. USB devices as vendor:product, comma separated, for example 046d:c52b (run 'lsusb' on the Unraid terminal). Add --device=/dev/bus/usb to Extra Parameters. Connect USB drives only after Windows is installed." Type="Variable" Display="advanced" Required="false" Mask="false"/>
 
   <!-- Extras -->
-  <Config Name="Audio in web console" Target="AUDIO" Default="N|Y" Mode="" Description="Stream Windows audio to the web console." Type="Variable" Display="advanced" Required="false" Mask="false">N</Config>
+  <Config Name="Sound" Target="AUDIO" Default="Y|N" Mode="" Description="Y = Windows' sound plays in the web console, and in Moonlight with streaming on. N = no sound in either." Type="Variable" Display="advanced" Required="false" Mask="false">Y</Config>
   <Config Name="Extra QEMU arguments" Target="ARGUMENTS" Default="" Mode="" Description="Optional raw QEMU arguments, for experts." Type="Variable" Display="advanced" Required="false" Mask="false"/>
 </Container>

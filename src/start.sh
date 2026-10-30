@@ -22,6 +22,12 @@ set -Eeuo pipefail
 #   GPU_PRIMARY       Y = GPU is the only display, turns the web console off
 #   USB_PASSTHROUGH   USB devices as "vendor:product", e.g. "046d:c52b"
 #
+# Streaming (shared Nvidia GPU):
+#
+#   STREAM            Y = Sunshine in the container streams Windows to Moonlight,
+#                     encoded on the GPU (NVENC) instead of on Windows' cores.
+#                     Turns AUDIO on unless it is set to N, for the sound.
+#
 # Safety:
 #
 #   ALLOW_WEAK_PASSWORD  Y = allow an empty or default PASSWORD (not recommended)
@@ -38,6 +44,9 @@ set -Eeuo pipefail
 : "${GPU:="N"}"
 : "${RENDERNODE:=""}"
 : "${ALLOW_WEAK_PASSWORD:="N"}"
+: "${STREAM:="N"}"
+: "${USER_PORTS:=""}"
+: "${HOST_PORTS:=""}"
 
 # Overridable so the hook can be tested against a fake /sys and /dev.
 SYSFS="${VFIO_SYSFS:-/sys}"
@@ -46,6 +55,18 @@ HOST_KERNEL="${HOOK_KERNEL:-$(uname -r)}"
 LIBROOT="${HOOK_LIBROOT:-}"
 HOSTLIBS="${HOOK_HOSTLIBS:-/run/nvidia-host}"
 DOCKER_CFG="${HOOK_DOCKER_CFG:-/run/unraid/docker.cfg}"
+STREAM_SOCKET="${HOOK_STREAM_SOCKET:-/run/winbox-stream.sock}"
+STREAM_AUDIO_SOCKET="${HOOK_STREAM_AUDIO_SOCKET:-/run/shm/audio.sock}"   # upstream's audio relay
+STREAM_CONFIG="${HOOK_STREAM_CONFIG:-/storage}"
+STREAM_LOG="${HOOK_STREAM_LOG:-/var/log/sunshine.log}"
+STREAM_RESTART="${HOOK_STREAM_RESTART:-10}"   # seconds; 0 runs Sunshine once
+
+STREAM_NAT_CHAIN="${HOOK_STREAM_NAT_CHAIN:-QEMU_DNAT}"   # upstream's NAT forward to Windows
+STREAM_NAT_WAIT="${HOOK_STREAM_NAT_WAIT:-600}"   # seconds
+
+# Sunshine's ports (Moonlight's defaults).
+SUNSHINE_PORTS="47984/tcp 47989/tcp 47990/tcp 48010/tcp 47998/udp 47999/udp 48000/udp"
+SUNSHINE_UDP="47998:48000"
 
 hookInfo () { printf "%b%s%b" "\E[1;34m❯ \E[1;36m" "${1:-}" "\E[0m\n"; }
 hookWarn () { printf "%b%s%b" "\E[1;31m❯ " "Warning: ${1:-}" "\E[0m\n" >&2; }
@@ -406,6 +427,116 @@ stopTimeoutNotice() {
   hookInfo "Unraid: set Settings > Docker > Docker Stop Timeout to $need or more so Windows can shut down cleanly (see README)."
 }
 
+# With STREAM=Y, Sunshine's ports belong to the container, not Windows.
+# User-mode networking (passt) forwards only USER_PORTS, so drop them there.
+# NAT networking (upstream's default) forwards every port but HOST_PORTS to
+# Windows, so add them there; see streamUdp for the UDP ones.
+streamPorts() {
+
+  local port num proto kept="" host=""
+
+  for port in ${USER_PORTS//,/ }; do
+    num="${port%/*}"
+    proto="tcp"
+    [[ "${port,,}" == */udp ]] && proto="udp"
+    [[ " $SUNSHINE_PORTS " == *" $num/$proto "* ]] && continue
+    kept+="${kept:+,}$port"
+  done
+  USER_PORTS="$kept"
+
+  if streamNat; then
+    for port in $SUNSHINE_PORTS; do
+      [[ "$port" == */tcp ]] && host+="${host:+,}${port%/tcp}"
+    done
+    HOST_PORTS="${HOST_PORTS:+$HOST_PORTS,}$host"
+  fi
+}
+
+# Same test as upstream's isNAT, for the NETWORK value it will see.
+streamNat() {
+  hookEnabled "${DHCP:-N}" && return 1
+  case "${NETWORK:-Y}" in
+    [Nn][Aa][Tt] | [Tt][Aa][Pp] | [Tt][Uu][Nn] | [Tt][Uu][Nn][Tt][Aa][Pp] | [Yy] ) return 0 ;;
+  esac
+  return 1
+}
+
+# Upstream's NAT rules keep only TCP ports out of the forward to Windows, so
+# Sunshine's video, audio and control (UDP) would go to Windows. Once the
+# rules exist, return those ports to the container ahead of the forward.
+streamUdp() {
+
+  local i
+
+  for (( i = 0; i < STREAM_NAT_WAIT; i++ )); do
+    if iptables -t nat -S "$STREAM_NAT_CHAIN" >/dev/null 2>&1; then
+      iptables -t nat -C "$STREAM_NAT_CHAIN" -p udp --dport "$SUNSHINE_UDP" -j RETURN 2>/dev/null \
+        || iptables -t nat -I "$STREAM_NAT_CHAIN" 1 -p udp --dport "$SUNSHINE_UDP" -j RETURN \
+        || hookWarn "Could not keep Sunshine's UDP ports ($SUNSHINE_UDP) from Windows; Moonlight may not connect."
+      return 0
+    fi
+    sleep 1
+  done
+}
+
+# Sunshine (patched, see sunshine/README.md) takes the guest's screen from
+# QEMU's stream socket as a dmabuf and encodes it with NVENC, so Windows no
+# longer encodes the stream on its own cores. Its settings, pairings and login
+# live in $STREAM_CONFIG/sunshine, next to the Windows disk.
+startStream() {
+
+  local dir="$STREAM_CONFIG/sunshine"
+
+  if ! command -v sunshine >/dev/null; then
+    hookWarn "STREAM=Y needs Sunshine, which this image doesn't have. Streaming is off."
+    return 0
+  fi
+  if ! hookEnabled "$GPU" || [ -n "${GPU_PASSTHROUGH// /}" ]; then
+    hookWarn "STREAM=Y needs GPU=Y (the shared Nvidia GPU). Streaming is off."
+    return 0
+  fi
+
+  streamPorts
+  if streamNat; then
+    streamUdp &
+  fi
+  # QEMU (patched, see qemu-triton/README.md) serves the stream socket.
+  export WINBOX_STREAM_SOCKET="$STREAM_SOCKET"
+
+  # Sound comes from upstream's audio relay, which AUDIO=Y starts: QEMU's
+  # sound card output, as raw samples on a unix socket.
+  export WINBOX_AUDIO_SOCKET="$STREAM_AUDIO_SOCKET"
+  if [ -z "${AUDIO:-}" ]; then
+    export AUDIO="Y"
+  elif ! hookEnabled "$AUDIO"; then
+    hookInfo "STREAM=Y: set 'Sound' (AUDIO) to Y for sound in Moonlight."
+  fi
+
+  mkdir -p "$dir"
+  if [ ! -f "$dir/sunshine.conf" ]; then
+    printf '%s\n' "encoder = nvenc" "origin_web_ui_allowed = lan" "upnp = disabled" > "$dir/sunshine.conf"
+  fi
+  if [ ! -f "$dir/apps.json" ]; then
+    printf '%s\n' '{"env": {}, "apps": [{"name": "Desktop", "image-path": "desktop.png"}]}' > "$dir/apps.json"
+  fi
+  # The web console's login becomes Sunshine's, until it's changed there.
+  if ! grep -qs '"username"' "$dir/sunshine_state.json" && [ -n "${USERNAME:-}" ] && [ -n "${PASSWORD:-}" ]; then
+    XDG_CONFIG_HOME="$STREAM_CONFIG" sunshine --creds "$USERNAME" "$PASSWORD" >/dev/null 2>&1 \
+      || hookWarn "Could not set Sunshine's login."
+  fi
+
+  # Restart Sunshine if it stops; QEMU and the container outlive it.
+  (
+    while true; do
+      XDG_CONFIG_HOME="$STREAM_CONFIG" sunshine "$dir/sunshine.conf" >>"$STREAM_LOG" 2>&1 || :
+      (( STREAM_RESTART > 0 )) || break
+      sleep "$STREAM_RESTART"
+    done
+  ) &
+
+  hookInfo "Streaming with Sunshine on the GPU (NVENC). Pair Moonlight once in Sunshine's web UI on port 47990. Log: $STREAM_LOG"
+}
+
 unraidHook() {
 
   local extra=""
@@ -420,6 +551,10 @@ unraidHook() {
     # GPU. Without it, fall back to a plain virtio display.
     VGA="virtio"
     hookInfo "GPU acceleration is off, so Windows gets a plain virtio display (no DirectX on the GPU)."
+  fi
+
+  if hookEnabled "$STREAM"; then
+    startStream
   fi
 
   if [ -n "${GPU_PASSTHROUGH// /}${PCI_PASSTHROUGH// /}" ]; then

@@ -266,5 +266,78 @@ out=$(runHook HOST_OS=Unraid TIMEOUT=200)
 expect "a longer TIMEOUT raises the need" "$out" "to 215 or more"
 rm -f "$FAKE/docker.cfg"
 
+
+# --- Streaming ----------------------------------------------------------------
+
+out=$(runHook STREAM=Y GPU=Y "${NV[@]}")
+expect "STREAM=Y needs Sunshine" "$out" "STREAM=Y needs Sunshine"
+
+out=$(env -i PATH="$PATH" UNRAID_HOOK_TEST=Y bash -c 'source "$0"
+  USER_PORTS="3389,47984,47989/tcp,47990,48010,47998/udp,47999/UDP,48000/udp,8080,47998"
+  streamPorts; printf "PORTS=%s\n" "$USER_PORTS"' "$HOOK" 2>&1)
+expect "Sunshine's ports leave USER_PORTS" "$out" "PORTS=3389,8080,47998"$'\n'
+
+out=$(env -i PATH="$PATH" UNRAID_HOOK_TEST=Y bash -c 'source "$0"
+  HOST_PORTS="8080"; streamPorts; printf "HOST=%s\n" "$HOST_PORTS"' "$HOOK" 2>&1)
+expect "NAT keeps Sunshine's TCP ports in the container" "$out" "HOST=8080,47984,47989,47990,48010"$'\n'
+out=$(env -i PATH="$PATH" UNRAID_HOOK_TEST=Y NETWORK=user bash -c 'source "$0"
+  streamPorts; printf "HOST=%s\n" "$HOST_PORTS"' "$HOOK" 2>&1)
+expect "user-mode networking leaves HOST_PORTS alone" "$out" "HOST="$'\n'
+out=$(env -i PATH="$PATH" UNRAID_HOOK_TEST=Y DHCP=Y bash -c 'source "$0"
+  streamPorts; printf "HOST=%s\n" "$HOST_PORTS"' "$HOOK" 2>&1)
+expect "DHCP networking leaves HOST_PORTS alone" "$out" "HOST="$'\n'
+
+# A fake iptables: the NAT chain exists, and every change is recorded.
+mkdir -p "$FAKE/ipt"
+cat > "$FAKE/ipt/iptables" <<'EOF_IPTABLES'
+#!/usr/bin/env bash
+case "$*" in
+  "-t nat -S QEMU_DNAT") exit 0 ;;
+  "-t nat -S "*) exit 1 ;;
+  *" -C "*) exit 1 ;;
+esac
+printf 'iptables %s\n' "$*" >> "$FAKE_IPTABLES_LOG"
+EOF_IPTABLES
+chmod +x "$FAKE/ipt/iptables"
+out=$(env -i PATH="$FAKE/ipt:$PATH" FAKE_IPTABLES_LOG="$FAKE/iptables.calls" UNRAID_HOOK_TEST=Y bash -c 'source "$0"
+  streamUdp' "$HOOK" 2>&1)
+expect "NAT returns Sunshine's UDP ports to the container" "$(cat "$FAKE/iptables.calls")" \
+  "iptables -t nat -I QEMU_DNAT 1 -p udp --dport 47998:48000 -j RETURN"
+out=$(env -i PATH="$FAKE/ipt:$PATH" FAKE_IPTABLES_LOG="$FAKE/iptables.calls" UNRAID_HOOK_TEST=Y \
+  HOOK_STREAM_NAT_CHAIN=MISSING HOOK_STREAM_NAT_WAIT=1 bash -c 'source "$0"
+  streamUdp; echo done' "$HOOK" 2>&1)
+expect "no NAT chain, no UDP rule" "$out" "done"
+expect "only one UDP rule was added" "$(grep -c . "$FAKE/iptables.calls")" "1"
+
+# A fake Sunshine that records how it was called.
+mkdir -p "$FAKE/bin"
+cat > "$FAKE/bin/sunshine" <<'EOF_SUNSHINE'
+#!/usr/bin/env bash
+printf 'sunshine %s XDG=%s SOCKET=%s AUDIO=%s\n' "$*" "$XDG_CONFIG_HOME" "$WINBOX_STREAM_SOCKET" "$WINBOX_AUDIO_SOCKET" >> "$FAKE_SUNSHINE_LOG"
+EOF_SUNSHINE
+chmod +x "$FAKE/bin/sunshine"
+STREAMENV=(PATH="$FAKE/bin:$PATH" FAKE_SUNSHINE_LOG="$FAKE/sunshine.calls" HOOK_STREAM_CONFIG="$FAKE/storage"
+           HOOK_STREAM_LOG="$FAKE/sunshine.log" HOOK_STREAM_RESTART=0 HOOK_STREAM_SOCKET=/run/test.sock
+           HOOK_STREAM_NAT_WAIT=0)
+
+out=$(runHook "${STREAMENV[@]}" STREAM=Y)
+expect "STREAM=Y needs GPU=Y" "$out" "STREAM=Y needs GPU=Y"
+
+out=$(runHook "${STREAMENV[@]}" STREAM=Y GPU=Y "${NV[@]}" USERNAME=winuser USER_PORTS=47989,3390)
+expect "STREAM=Y starts Sunshine" "$out" "Streaming with Sunshine on the GPU"
+wait_for() { for _ in $(seq 50); do [ -s "$1" ] && grep -q "$2" "$1" && return 0; sleep 0.1; done; return 1; }
+wait_for "$FAKE/sunshine.calls" "sunshine.conf"
+calls=$(cat "$FAKE/sunshine.calls")
+expect "login comes from the web console" "$calls" "sunshine --creds winuser s3cret-Pass XDG=$FAKE/storage"
+expect "Sunshine runs on its config" "$calls" "sunshine $FAKE/storage/sunshine/sunshine.conf XDG=$FAKE/storage SOCKET=/run/test.sock AUDIO=/run/shm/audio.sock"
+expect "first start writes a config" "$(cat "$FAKE/storage/sunshine/sunshine.conf")" "encoder = nvenc"
+expect "first start writes the apps" "$(cat "$FAKE/storage/sunshine/apps.json")" '"name": "Desktop"'
+
+audio=$(env -i PATH="$FAKE/bin:$PATH" UNRAID_HOOK_TEST=Y "${STREAMENV[@]}" GPU=Y bash -c 'source "$0"
+  startStream >/dev/null 2>&1; printf "AUDIO=%s\n" "$AUDIO"' "$HOOK" 2>&1)
+expect "STREAM=Y turns sound on" "$audio" "AUDIO=Y"
+out=$(runHook "${STREAMENV[@]}" STREAM=Y GPU=Y "${NV[@]}" AUDIO=N)
+expect "STREAM=Y with AUDIO=N says how to get sound" "$out" "(AUDIO) to Y for sound in Moonlight"
+
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

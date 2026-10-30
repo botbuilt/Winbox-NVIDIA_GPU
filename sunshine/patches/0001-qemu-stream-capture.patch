@@ -1,0 +1,1269 @@
+diff --git a/cmake/compile_definitions/linux.cmake b/cmake/compile_definitions/linux.cmake
+index a842678..7e21a77 100644
+--- a/cmake/compile_definitions/linux.cmake
++++ b/cmake/compile_definitions/linux.cmake
+@@ -99,6 +99,13 @@ if(LIBDRM_FOUND)
+         add_compile_definitions(SUNSHINE_BUILD_DRM)
+         list(APPEND PLATFORM_TARGET_FILES
+                 "${CMAKE_SOURCE_DIR}/src/platform/linux/kmsgrab.cpp")
++
++        # WinBox: capture a QEMU guest from QEMU's stream socket
++        add_compile_definitions(SUNSHINE_BUILD_QEMU)
++        list(APPEND PLATFORM_TARGET_FILES
++                "${CMAKE_SOURCE_DIR}/src/platform/linux/qemu_stream.h"
++                "${CMAKE_SOURCE_DIR}/src/platform/linux/qemuaudio.cpp"
++                "${CMAKE_SOURCE_DIR}/src/platform/linux/qemugrab.cpp")
+         list(APPEND SUNSHINE_DEFINITIONS EGL_NO_X11=1)
+     endif()
+ endif()
+diff --git a/src/confighttp.cpp b/src/confighttp.cpp
+index edf1c57..4ce1317 100644
+--- a/src/confighttp.cpp
++++ b/src/confighttp.cpp
+@@ -43,6 +43,10 @@
+   #include <CoreFoundation/CoreFoundation.h>
+ #endif
+ 
++#ifdef SUNSHINE_BUILD_QEMU
++  #include "platform/linux/qemu_stream.h"
++#endif
++
+ // local includes
+ #include "config.h"
+ #include "confighttp.h"
+@@ -860,6 +864,28 @@ namespace confighttp {
+       });
+     };
+ 
++#ifdef SUNSHINE_BUILD_QEMU
++    // WinBox: the web UI is opened through the container's mapped port, at an
++    // address Sunshine can't know. Trust the page's own origin: the Origin or
++    // Referer must name the host the browser sent this request to.
++    auto is_same_host = [&request](const std::string_view url) {
++      const auto host_it = request->header.find("Host");
++      if (host_it == request->header.end() || host_it->second.empty()) {
++        return false;
++      }
++      const std::string self = "https://" + host_it->second;
++      return url.starts_with(self) && (url.length() == self.length() || url[self.length()] == '/');
++    };
++    if (platf::qemu::enabled()) {
++      const auto self_origin_it = request->header.find("Origin");
++      const auto self_referer_it = request->header.find("Referer");
++      if ((self_origin_it != request->header.end() && is_same_host(self_origin_it->second)) ||
++          (self_origin_it == request->header.end() && self_referer_it != request->header.end() && is_same_host(self_referer_it->second))) {
++        return true;
++      }
++    }
++#endif
++
+     // Check if the request is from the same origin (Origin or Referer header matches configured allowed origins)
+     const auto origin_it = request->header.find("Origin");
+     if (origin_it != request->header.end() && is_allowed_origin(origin_it->second)) {
+diff --git a/src/platform/linux/audio.cpp b/src/platform/linux/audio.cpp
+index f13e0db..d343dc9 100644
+--- a/src/platform/linux/audio.cpp
++++ b/src/platform/linux/audio.cpp
+@@ -16,6 +16,9 @@
+ #include <pulse/simple.h>
+ 
+ // local includes
++#ifdef SUNSHINE_BUILD_QEMU
++  #include "qemu_stream.h"
++#endif
+ #include "src/config.h"
+ #include "src/logging.h"
+ #include "src/platform/common.h"
+@@ -716,6 +719,12 @@ namespace platf {
+    * @brief Create the platform audio controller.
+    */
+   std::unique_ptr<audio_control_t> audio_control() {
++#ifdef SUNSHINE_BUILD_QEMU
++    // WinBox: there is no PulseAudio next to QEMU; the guest's sound card is the source.
++    if (qemu::enabled()) {
++      return qemu::audio_control();
++    }
++#endif
+     auto audio = std::make_unique<pa::server_t>();
+ 
+     if (audio->init()) {
+diff --git a/src/platform/linux/misc.cpp b/src/platform/linux/misc.cpp
+index b89b9b9..6e09b15 100644
+--- a/src/platform/linux/misc.cpp
++++ b/src/platform/linux/misc.cpp
+@@ -59,6 +59,9 @@
+ // local includes
+ #include "graphics.h"
+ #include "misc.h"
++#ifdef SUNSHINE_BUILD_QEMU
++  #include "qemu_stream.h"
++#endif
+ #include "src/boost_process_compat.h"
+ #include "src/config.h"
+ #include "src/entry_handler.h"
+@@ -156,6 +159,12 @@ namespace dyn {
+ 
+ namespace platf {
+   std::vector<permission_status_t> get_permission_statuses() {
++#ifdef SUNSHINE_BUILD_QEMU
++    // WinBox: input goes to the guest through QEMU, not through uinput.
++    if (qemu::enabled()) {
++      return {{"input", "granted", config::input.keyboard || config::input.mouse || config::input.controller, true}};
++    }
++#endif
+     // Match libvirtualhid's device paths and its read/write access check.
+     bool input_access = access("/dev/uinput", R_OK | W_OK) == 0;
+ #ifndef __FreeBSD__
+@@ -1140,6 +1149,9 @@ namespace platf {
+      * @brief Enumerates supported source options.
+      */
+     enum source_e : std::size_t {
++#ifdef SUNSHINE_BUILD_QEMU
++      QEMU,  ///< WinBox QEMU stream socket
++#endif
+ #ifdef SUNSHINE_BUILD_CUDA
+       NVFBC,  ///< NvFBC
+ #endif
+@@ -1310,6 +1322,11 @@ namespace platf {
+    * @brief List display names accepted by the selected capture backend.
+    */
+   std::vector<std::string> display_names(mem_type_e hwdevice_type) {
++#ifdef SUNSHINE_BUILD_QEMU
++    if (sources[source::QEMU]) {
++      return qemu::display_names();
++    }
++#endif
+ #ifdef SUNSHINE_BUILD_CUDA
+     // display using NvFBC only supports mem_type_e::cuda
+     if (sources[source::NVFBC] && hwdevice_type == mem_type_e::cuda) {
+@@ -1363,6 +1380,13 @@ namespace platf {
+   }
+ 
+   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
++#ifdef SUNSHINE_BUILD_QEMU
++    if (sources[source::QEMU]) {
++      BOOST_LOG(info) << "Screencasting from the WinBox QEMU stream socket"sv;
++      return qemu::display(hwdevice_type, display_name, config);
++    }
++#endif
++
+     // Please ensure that KMS followed by CUDA remains at the top so that we can
+     // drop DRM worker privileges once neither backend requires it.
+ 
+@@ -1465,6 +1489,12 @@ namespace platf {
+       }
+     }
+ #endif
++#ifdef SUNSHINE_BUILD_QEMU
++    // WinBox: next to QEMU, the guest's screen is the only thing to stream.
++    if ((selected_capture.empty() || selected_capture == "qemu") && qemu::enabled()) {
++      sources[source::QEMU] = true;
++    }
++#endif
+ #ifdef SUNSHINE_BUILD_CUDA
+     if (((selected_capture.empty() && sources.none()) || selected_capture == "nvfbc") && verify_nvfbc()) {
+       sources[source::NVFBC] = true;
+diff --git a/src/platform/linux/qemu_stream.h b/src/platform/linux/qemu_stream.h
+new file mode 100644
+index 0000000..e3219c4
+--- /dev/null
++++ b/src/platform/linux/qemu_stream.h
+@@ -0,0 +1,48 @@
++/**
++ * @file src/platform/linux/qemu_stream.h
++ * @brief WinBox: capture and input through a QEMU stream socket.
++ *
++ * WinBox runs Windows in QEMU inside the same container as Sunshine. QEMU
++ * hands the guest's scanout over a unix socket (WINBOX_STREAM_SOCKET) as a
++ * dmabuf, and takes keyboard and mouse input back on the same socket. Sound
++ * comes from the container's audio relay socket (WINBOX_AUDIO_SOCKET).
++ */
++#pragma once
++
++// standard includes
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++// local includes
++#include "src/platform/common.h"
++
++namespace platf::qemu {
++  /**
++   * @brief Whether Sunshine runs next to a WinBox QEMU (WINBOX_STREAM_SOCKET is set).
++   */
++  bool enabled();
++
++  /**
++   * @brief Display names offered by the QEMU capture source.
++   */
++  std::vector<std::string> display_names();
++
++  /**
++   * @brief Create the QEMU capture source.
++   */
++  std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const ::video::config_t &config);
++
++  void move_mouse(int delta_x, int delta_y);
++  void abs_mouse(const touch_port_t &touch_port, float x, float y);
++  void button_mouse(int button, bool release);
++  void scroll(int high_res_distance);
++  void hscroll(int high_res_distance);
++  void keyboard_update(std::uint16_t modcode, bool release, bool extended);
++
++  /**
++   * @brief Audio capture from QEMU's sound card, through the container's audio relay.
++   */
++  std::unique_ptr<audio_control_t> audio_control();
++}  // namespace platf::qemu
+diff --git a/src/platform/linux/qemuaudio.cpp b/src/platform/linux/qemuaudio.cpp
+new file mode 100644
+index 0000000..7b4ce2e
+--- /dev/null
++++ b/src/platform/linux/qemuaudio.cpp
+@@ -0,0 +1,297 @@
++/**
++ * @file src/platform/linux/qemuaudio.cpp
++ * @brief WinBox: capture a QEMU guest's sound from the container's audio relay.
++ *
++ * With AUDIO=Y, QEMU writes the guest's sound card output (48 kHz, 16-bit,
++ * stereo) to a FIFO, and the container's relay (/run/audio.py) copies the raw
++ * samples to every client of a unix socket, WINBOX_AUDIO_SOCKET. There is no
++ * PulseAudio in the container, so Sunshine reads that socket instead.
++ *
++ * QEMU's WAV writer is buffered, so samples arrive in bursts of about 21 ms,
++ * at times late, and not at all while Windows plays nothing. sample() plays
++ * them from a small jitter buffer on a steady frame clock, and sends silence
++ * while the guest is quiet.
++ */
++// standard includes
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <cstdlib>
++#include <cstdint>
++#include <cstring>
++#include <vector>
++
++// platform includes
++#include <fcntl.h>
++#include <poll.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++// local includes
++#include "qemu_stream.h"
++#include "src/logging.h"
++
++using namespace std::literals;
++
++namespace platf::qemu {
++  namespace {
++    using steady = std::chrono::steady_clock;
++
++    constexpr std::uint32_t QEMU_RATE = 48000;
++    constexpr int QEMU_CHANNELS = 2;
++    constexpr std::size_t QEMU_FRAME_BYTES = QEMU_CHANNELS * sizeof(std::int16_t);
++
++    // QEMU's WAV writer flushes every 4 KiB (21.3 ms of sound), and its timer
++    // runs on QEMU's main loop, which GPU work can hold up. Playback starts
++    // once this much is buffered, so late bursts don't break up the sound.
++    constexpr auto jitter_buffer = 60ms;
++    // Without new samples for this long, the guest has stopped playing.
++    constexpr auto burst_gap = 100ms;
++    // How long a due frame waits for late samples before it is cut short.
++    constexpr auto late_slack = 10ms;
++    // More buffered than the jitter buffer plus this, and the oldest samples
++    // are dropped to keep the delay down.
++    constexpr auto max_extra = 60ms;
++    constexpr auto reconnect_interval = 1s;
++
++    constexpr std::size_t bytes_for(std::chrono::milliseconds ms) {
++      return static_cast<std::size_t>(QEMU_RATE * ms.count() / 1000) * QEMU_FRAME_BYTES;
++    }
++
++    const char *audio_socket_path() {
++      const char *path = std::getenv("WINBOX_AUDIO_SOCKET");
++      return path && *path ? path : nullptr;
++    }
++
++    class mic_qemu_t: public mic_t {
++    public:
++      mic_qemu_t(const std::uint8_t *mapping, int channels, std::uint32_t frame_size, bool continuous):
++          channels {channels},
++          frame_size {frame_size},
++          continuous {continuous},
++          period {std::chrono::duration_cast<steady::duration>(std::chrono::duration<double>(static_cast<double>(frame_size) / QEMU_RATE))},
++          source(channels, -1) {
++        // Stereo goes to the front left and right speakers; any other
++        // channel of a surround layout stays silent.
++        for (int i = 0; i < channels; ++i) {
++          if (mapping[i] == speaker::FRONT_LEFT) {
++            source[i] = 0;
++          } else if (mapping[i] == speaker::FRONT_RIGHT) {
++            source[i] = 1;
++          }
++        }
++        due = steady::now();
++      }
++
++      ~mic_qemu_t() override {
++        disconnect();
++      }
++
++      /**
++       * Hands out one frame per frame period. While the guest plays, frames
++       * come from a jitter buffer; while it is quiet, they are silence (or
++       * timeouts, if the client doesn't want continuous audio).
++       */
++      capture_e sample(std::vector<float> &frame_buffer) override {
++        const std::size_t need = frame_size * QEMU_FRAME_BYTES;
++
++        // After a stall (or a quiet spell without continuous audio) the
++        // frame clock is stale; restart it.
++        if (steady::now() - due > max_extra) {
++          due = steady::now();
++        }
++
++        // Collect samples until this frame is due.
++        pump_until(due, SIZE_MAX);
++
++        if (!playing && buffer.size() >= need &&
++            (buffer.size() >= bytes_for(jitter_buffer) || steady::now() - last_data > burst_gap)) {
++          playing = true;
++        }
++
++        std::size_t have = 0;
++        if (playing) {
++          if (buffer.size() < need) {
++            pump_until(due + late_slack, need);
++          }
++          have = std::min(buffer.size(), need) / QEMU_FRAME_BYTES;
++          if (have * QEMU_FRAME_BYTES < need) {
++            // Ran dry: the guest stopped, or its samples are late. Play what
++            // is left and buffer up again before playing more.
++            playing = false;
++          }
++        }
++
++        due += period;
++
++        if (have == 0 && !continuous) {
++          return capture_e::timeout;
++        }
++
++        std::fill(frame_buffer.begin(), frame_buffer.end(), 0.0f);
++        for (std::size_t f = 0; f < have; ++f) {
++          std::int16_t in[QEMU_CHANNELS];
++          std::memcpy(in, buffer.data() + f * QEMU_FRAME_BYTES, sizeof(in));
++          for (int c = 0; c < channels; ++c) {
++            if (source[c] >= 0) {
++              frame_buffer[f * channels + c] = static_cast<float>(in[source[c]]) / 32768.0f;
++            }
++          }
++        }
++        buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(have * QEMU_FRAME_BYTES));
++
++        // Keep the delay bounded if samples pile up.
++        if (buffer.size() > bytes_for(jitter_buffer + max_extra)) {
++          const std::size_t drop = buffer.size() - bytes_for(jitter_buffer);
++          buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(drop));
++        }
++
++        return capture_e::ok;
++      }
++
++    private:
++      bool connect_socket(steady::time_point now) {
++        if (now < next_connect) {
++          return false;
++        }
++        next_connect = now + reconnect_interval;
++
++        const char *path = audio_socket_path();
++        if (!path) {
++          return false;
++        }
++
++        sockaddr_un addr {};
++        addr.sun_family = AF_UNIX;
++        if (std::strlen(path) >= sizeof(addr.sun_path)) {
++          return false;
++        }
++        std::strcpy(addr.sun_path, path);
++
++        int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
++        if (s < 0) {
++          return false;
++        }
++        if (connect(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
++          close(s);
++          if (!warned) {
++            BOOST_LOG(warning) << "QEMU audio: no sound from "sv << path << " (set AUDIO=Y for sound in Moonlight)"sv;
++            warned = true;
++          }
++          return false;
++        }
++
++        BOOST_LOG(info) << "QEMU audio: connected to "sv << path;
++        fd = s;
++        warned = false;
++        partial.clear();
++        return true;
++      }
++
++      void read_socket() {
++        char chunk[16384];
++        while (true) {
++          ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
++          if (n > 0) {
++            last_data = steady::now();
++            // Keep whole frames in the buffer; a split frame waits in partial.
++            partial.insert(partial.end(), chunk, chunk + n);
++            const std::size_t whole = partial.size() / QEMU_FRAME_BYTES * QEMU_FRAME_BYTES;
++            buffer.insert(buffer.end(), partial.begin(), partial.begin() + static_cast<std::ptrdiff_t>(whole));
++            partial.erase(partial.begin(), partial.begin() + static_cast<std::ptrdiff_t>(whole));
++            continue;
++          }
++          if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++            return;
++          }
++          if (n < 0 && errno == EINTR) {
++            continue;
++          }
++          BOOST_LOG(info) << "QEMU audio: disconnected"sv;
++          disconnect();
++          return;
++        }
++      }
++
++      void disconnect() {
++        if (fd >= 0) {
++          close(fd);
++          fd = -1;
++        }
++      }
++
++      /**
++       * Reads samples until `deadline`, or until `enough` bytes are buffered.
++       */
++      void pump_until(steady::time_point deadline, std::size_t enough) {
++        while (buffer.size() < enough) {
++          const auto now = steady::now();
++          if (now >= deadline) {
++            return;
++          }
++          if (fd < 0 && !connect_socket(now)) {
++            wait_until(deadline);
++            return;
++          }
++
++          pollfd pfd {fd, POLLIN, 0};
++          const auto timeout = std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count();
++          if (poll(&pfd, 1, static_cast<int>(timeout)) > 0) {
++            read_socket();
++          }
++        }
++      }
++
++      static void wait_until(steady::time_point deadline) {
++        const auto now = steady::now();
++        if (deadline > now) {
++          poll(nullptr, 0, static_cast<int>(std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count()));
++        }
++      }
++
++      int channels;
++      std::uint32_t frame_size;
++      bool continuous;
++      steady::duration period;
++      std::vector<int> source;  ///< QEMU channel for each output channel, or -1.
++
++      int fd = -1;
++      bool warned = false;
++      steady::time_point next_connect {};
++      steady::time_point due;
++      steady::time_point last_data {};
++      bool playing = false;
++      std::vector<std::uint8_t> buffer;
++      std::vector<std::uint8_t> partial;
++    };
++
++    class audio_control_qemu_t: public audio_control_t {
++    public:
++      int set_sink(const std::string &) override {
++        return 0;
++      }
++
++      std::unique_ptr<mic_t> microphone(const std::uint8_t *mapping, int channels, std::uint32_t sample_rate, std::uint32_t frame_size, bool continuous, bool) override {
++        if (sample_rate != QEMU_RATE) {
++          BOOST_LOG(error) << "QEMU audio: "sv << sample_rate << " Hz requested, QEMU plays "sv << QEMU_RATE << " Hz"sv;
++          return nullptr;
++        }
++        return std::make_unique<mic_qemu_t>(mapping, channels, frame_size, continuous);
++      }
++
++      bool is_sink_available(const std::string &) override {
++        return true;
++      }
++
++      std::optional<sink_t> sink_info() override {
++        return sink_t {"qemu", std::nullopt};
++      }
++    };
++  }  // namespace
++
++  std::unique_ptr<audio_control_t> audio_control() {
++    BOOST_LOG(info) << "Audio from the WinBox QEMU audio relay"sv;
++    return std::make_unique<audio_control_qemu_t>();
++  }
++}  // namespace platf::qemu
+diff --git a/src/platform/linux/qemugrab.cpp b/src/platform/linux/qemugrab.cpp
+new file mode 100644
+index 0000000..0b21589
+--- /dev/null
++++ b/src/platform/linux/qemugrab.cpp
+@@ -0,0 +1,654 @@
++/**
++ * @file src/platform/linux/qemugrab.cpp
++ * @brief WinBox: capture a QEMU guest's screen from its stream socket.
++ *
++ * QEMU (WinBox patch, ui/winbox-stream.c) listens on WINBOX_STREAM_SOCKET.
++ * It sends the guest's scanout as a dmabuf, a notice per guest flush and the
++ * hardware cursor, and takes keyboard and mouse input back. The dmabuf stays
++ * on the GPU: it is imported with EGL, converted in GL and handed to NVENC
++ * through CUDA, the same path as KMS capture.
++ */
++// standard includes
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <condition_variable>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <mutex>
++#include <thread>
++
++// platform includes
++#include <fcntl.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++// local includes
++#include "cuda.h"
++#include "graphics.h"
++#include "misc.h"
++#include "qemu_stream.h"
++#include "src/logging.h"
++#include "src/video.h"
++
++using namespace std::literals;
++
++namespace platf::qemu {
++  namespace {
++    // Wire protocol, mirrored from QEMU's include/ui/winbox-stream.h.
++    constexpr std::uint32_t WBS_VERSION = 1;
++
++    enum : std::uint32_t {
++      WBS_HELLO = 1,
++      WBS_SCANOUT = 2,
++      WBS_DISABLE = 3,
++      WBS_FRAME = 4,
++      WBS_CURSOR = 5,
++      WBS_MOUSE = 6,
++      WBS_KEY = 16,
++      WBS_ABS = 17,
++      WBS_REL = 18,
++      WBS_BUTTON = 19,
++      WBS_WHEEL = 20,
++    };
++
++    constexpr std::uint32_t WBS_KEY_DOWN = 1;
++    constexpr std::uint32_t WBS_KEY_EXTENDED = 2;
++    constexpr std::uint32_t WBS_ABS_MAX = 0x7fff;
++
++    struct wbs_header_t {
++      std::uint32_t type;
++      std::uint32_t size;
++    };
++
++    struct wbs_hello_t {
++      std::uint32_t version;
++    };
++
++    struct wbs_scanout_t {
++      std::uint32_t width;
++      std::uint32_t height;
++      std::uint32_t stride;
++      std::uint32_t fourcc;
++      std::uint64_t modifier;
++      std::uint32_t x;
++      std::uint32_t y;
++      std::uint32_t w;
++      std::uint32_t h;
++      std::uint32_t y0_top;
++      std::uint32_t serial;
++    };
++
++    struct wbs_frame_t {
++      std::uint32_t serial;
++      std::uint32_t seq;
++    };
++
++    struct wbs_cursor_t {
++      std::uint32_t width;
++      std::uint32_t height;
++      std::int32_t hot_x;
++      std::int32_t hot_y;
++    };
++
++    struct wbs_mouse_t {
++      std::int32_t x;
++      std::int32_t y;
++      std::uint32_t visible;
++    };
++
++    struct wbs_key_t {
++      std::uint32_t vk;
++      std::uint32_t flags;
++    };
++
++    struct wbs_abs_t {
++      std::uint32_t x;
++      std::uint32_t y;
++    };
++
++    struct wbs_rel_t {
++      std::int32_t dx;
++      std::int32_t dy;
++    };
++
++    struct wbs_button_t {
++      std::uint32_t button;
++      std::uint32_t down;
++    };
++
++    struct wbs_wheel_t {
++      std::int32_t dy;
++      std::int32_t dx;
++    };
++
++    static_assert(sizeof(wbs_scanout_t) == 48, "must match QEMU's WbsScanout");
++
++    /**
++     * @brief Connection to QEMU's stream socket, shared by capture and input.
++     *
++     * A reader thread keeps the connection up (QEMU may start after Sunshine,
++     * or restart) and keeps the latest scanout, cursor and pointer position.
++     */
++    class stream_t {
++    public:
++      static stream_t &get() {
++        static stream_t stream;
++        return stream;
++      }
++
++      /**
++       * @brief Wait until the guest has a screen, up to `timeout`.
++       */
++      bool wait_scanout(wbs_scanout_t &so, std::chrono::milliseconds timeout) {
++        std::unique_lock lock {mutex};
++        if (!cv.wait_for(lock, timeout, [this] {
++              return scanout_fd >= 0;
++            })) {
++          return false;
++        }
++        so = scanout;
++        return true;
++      }
++
++      /**
++       * @brief Duplicate the current scanout's dmabuf, -1 when there is none.
++       */
++      int dup_scanout(wbs_scanout_t &so, std::uint64_t &generation_out) {
++        std::lock_guard lock {mutex};
++        if (scanout_fd < 0) {
++          return -1;
++        }
++        so = scanout;
++        generation_out = generation;
++        return fcntl(scanout_fd, F_DUPFD_CLOEXEC, 0);
++      }
++
++      /**
++       * @brief Put the guest's hardware cursor on `img`, or clear it.
++       */
++      void load_cursor(egl::img_descriptor_t &img) {
++        std::lock_guard lock {mutex};
++        if (!mouse.visible || cursor_pixels.empty()) {
++          img.data = nullptr;
++          return;
++        }
++
++        if (img.serial != cursor_serial) {
++          img.buffer = cursor_pixels;
++          img.serial = cursor_serial;
++        }
++
++        img.x = mouse.x - cursor.hot_x;
++        img.y = mouse.y - cursor.hot_y;
++        img.src_w = cursor.width;
++        img.src_h = cursor.height;
++        img.width = cursor.width;
++        img.height = cursor.height;
++        img.pixel_pitch = 4;
++        img.row_pitch = img.pixel_pitch * img.width;
++        img.data = img.buffer.data();
++      }
++
++      /**
++       * @brief Send an input message; dropped while QEMU isn't connected.
++       */
++      void send(std::uint32_t type, const void *payload, std::size_t size) {
++        std::array<std::uint8_t, 64> buf {};
++        wbs_header_t header {type, static_cast<std::uint32_t>(size)};
++
++        if (sizeof(header) + size > buf.size()) {
++          return;
++        }
++        std::memcpy(buf.data(), &header, sizeof(header));
++        std::memcpy(buf.data() + sizeof(header), payload, size);
++
++        std::lock_guard lock {send_mutex};
++        if (sock >= 0) {
++          ::send(sock, buf.data(), sizeof(header) + size, MSG_NOSIGNAL | MSG_DONTWAIT);
++        }
++      }
++
++    private:
++      stream_t() {
++        std::thread {&stream_t::run, this}.detach();
++      }
++
++      static int connect_socket() {
++        const char *path = std::getenv("WINBOX_STREAM_SOCKET");
++        sockaddr_un addr {};
++
++        if (!path || !*path || std::strlen(path) >= sizeof(addr.sun_path)) {
++          return -1;
++        }
++        addr.sun_family = AF_UNIX;
++        std::strcpy(addr.sun_path, path);
++
++        int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
++        if (fd < 0) {
++          return -1;
++        }
++        if (connect(fd, (sockaddr *) &addr, sizeof(addr)) < 0) {
++          close(fd);
++          return -1;
++        }
++        return fd;
++      }
++
++      void run() {
++        std::vector<std::uint8_t> buf(1 << 20);
++        bool logged_wait = false;
++
++        while (true) {
++          int fd = connect_socket();
++          if (fd < 0) {
++            if (!logged_wait) {
++              BOOST_LOG(info) << "QEMU stream: waiting for QEMU on "sv << std::getenv("WINBOX_STREAM_SOCKET");
++              logged_wait = true;
++            }
++            std::this_thread::sleep_for(1s);
++            continue;
++          }
++          logged_wait = false;
++
++          {
++            std::lock_guard lock {send_mutex};
++            sock = fd;
++          }
++          BOOST_LOG(info) << "QEMU stream: connected"sv;
++
++          read_loop(fd, buf);
++
++          {
++            std::lock_guard lock {send_mutex};
++            sock = -1;
++          }
++          close(fd);
++          {
++            std::lock_guard lock {mutex};
++            set_scanout(-1, nullptr);
++            mouse.visible = 0;
++          }
++          cv.notify_all();
++          BOOST_LOG(info) << "QEMU stream: disconnected"sv;
++          std::this_thread::sleep_for(1s);
++        }
++      }
++
++      void read_loop(int fd, std::vector<std::uint8_t> &buf) {
++        while (true) {
++          iovec iov {buf.data(), buf.size()};
++          alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))];
++          msghdr msg {};
++          msg.msg_iov = &iov;
++          msg.msg_iovlen = 1;
++          msg.msg_control = control;
++          msg.msg_controllen = sizeof(control);
++
++          auto n = recvmsg(fd, &msg, MSG_CMSG_CLOEXEC);
++          if (n < 0 && errno == EINTR) {
++            continue;
++          }
++          if (n <= 0) {
++            return;
++          }
++
++          int passed_fd = -1;
++          for (auto cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
++            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
++              std::memcpy(&passed_fd, CMSG_DATA(cmsg), sizeof(int));
++            }
++          }
++
++          handle(buf.data(), static_cast<std::size_t>(n), passed_fd);
++        }
++      }
++
++      void handle(const std::uint8_t *data, std::size_t len, int passed_fd) {
++        wbs_header_t header;
++
++        if (len < sizeof(header)) {
++          if (passed_fd >= 0) {
++            close(passed_fd);
++          }
++          return;
++        }
++        std::memcpy(&header, data, sizeof(header));
++        const auto *payload = data + sizeof(header);
++        const auto size = std::min<std::size_t>(header.size, len - sizeof(header));
++
++        switch (header.type) {
++          case WBS_HELLO:
++            {
++              wbs_hello_t hello {};
++              std::memcpy(&hello, payload, std::min(size, sizeof(hello)));
++              if (hello.version != WBS_VERSION) {
++                BOOST_LOG(warning) << "QEMU stream: protocol version "sv << hello.version << ", expected "sv << WBS_VERSION;
++              }
++              break;
++            }
++          case WBS_SCANOUT:
++            if (size >= sizeof(wbs_scanout_t) && passed_fd >= 0) {
++              wbs_scanout_t so;
++              std::memcpy(&so, payload, sizeof(so));
++              {
++                std::lock_guard lock {mutex};
++                set_scanout(passed_fd, &so);
++              }
++              passed_fd = -1;
++              cv.notify_all();
++            }
++            break;
++          case WBS_DISABLE:
++            {
++              std::lock_guard lock {mutex};
++              set_scanout(-1, nullptr);
++            }
++            cv.notify_all();
++            break;
++          case WBS_FRAME:
++            break;
++          case WBS_CURSOR:
++            if (size >= sizeof(wbs_cursor_t)) {
++              wbs_cursor_t ci;
++              std::memcpy(&ci, payload, sizeof(ci));
++              const auto pixels = static_cast<std::size_t>(ci.width) * ci.height * 4;
++              if (size >= sizeof(ci) + pixels) {
++                std::lock_guard lock {mutex};
++                cursor = ci;
++                cursor_pixels.assign(payload + sizeof(ci), payload + sizeof(ci) + pixels);
++                ++cursor_serial;
++              }
++            }
++            break;
++          case WBS_MOUSE:
++            if (size >= sizeof(wbs_mouse_t)) {
++              std::lock_guard lock {mutex};
++              std::memcpy(&mouse, payload, sizeof(mouse));
++            }
++            break;
++          default:
++            break;
++        }
++
++        if (passed_fd >= 0) {
++          close(passed_fd);
++        }
++      }
++
++      // Caller holds mutex.
++      void set_scanout(int fd, const wbs_scanout_t *so) {
++        if (scanout_fd >= 0) {
++          close(scanout_fd);
++        }
++        scanout_fd = fd;
++        if (so) {
++          scanout = *so;
++          BOOST_LOG(debug) << "QEMU stream: scanout "sv << so->w << 'x' << so->h << " fourcc 0x"sv
++                           << util::hex(so->fourcc).to_string_view() << " modifier 0x"sv << util::hex(so->modifier).to_string_view();
++        }
++        // Zero marks a dummy image, so the first real scanout is 1.
++        ++generation;
++      }
++
++      std::mutex mutex;
++      std::condition_variable cv;
++      int scanout_fd = -1;
++      wbs_scanout_t scanout {};
++      std::uint64_t generation = 0;
++
++      wbs_cursor_t cursor {};
++      std::vector<std::uint8_t> cursor_pixels;
++      unsigned long cursor_serial = 0;
++      wbs_mouse_t mouse {};
++
++      std::mutex send_mutex;
++      int sock = -1;
++    };
++
++    /**
++     * @brief Capture source that hands QEMU's scanout dmabuf to the encoder.
++     */
++    class display_vram_t: public platf::display_t {
++    public:
++      explicit display_vram_t(mem_type_e mem_type):
++          mem_type {mem_type} {
++      }
++
++      int init(const std::string & /* display_name */, const ::video::config_t &config) {
++        delay = ::video::capture_frame_interval(config);
++
++        wbs_scanout_t so;
++        if (stream_t::get().wait_scanout(so, 3s)) {
++          width = static_cast<int>(so.w);
++          height = static_cast<int>(so.h);
++          img_offset_x = static_cast<int>(so.x);
++          img_offset_y = static_cast<int>(so.y);
++        } else {
++          // Windows is still booting, or the GPU driver isn't up yet. Stream
++          // a blank picture; the first real screen restarts capture.
++          BOOST_LOG(warning) << "QEMU stream: no guest screen yet"sv;
++          width = 1920;
++          height = 1080;
++        }
++
++        env_width = width;
++        env_height = height;
++        logical_width = width;
++        logical_height = height;
++        BOOST_LOG(info) << "QEMU stream: capturing "sv << width << 'x' << height;
++        return 0;
++      }
++
++      std::unique_ptr<avcodec_encode_device_t> make_avcodec_encode_device(pix_fmt_e pix_fmt) override {
++#ifdef SUNSHINE_BUILD_CUDA
++        if (mem_type == mem_type_e::cuda) {
++          return cuda::make_avcodec_gl_encode_device(width, height, img_offset_x, img_offset_y);
++        }
++#endif
++
++        BOOST_LOG(error) << "QEMU stream: capture supports NVENC only, not "sv << platf::from_pix_fmt(pix_fmt);
++        return nullptr;
++      }
++
++      std::shared_ptr<img_t> alloc_img() override {
++        auto img = std::make_shared<egl::img_descriptor_t>();
++
++        img->width = width;
++        img->height = height;
++        img->serial = std::numeric_limits<decltype(img->serial)>::max();
++        img->data = nullptr;
++        img->pixel_pitch = 4;
++
++        img->sequence = 0;
++        img->sd.fds.fill(-1);
++
++        return img;
++      }
++
++      int dummy_img(platf::img_t * /* img */) override {
++        // Empty images are recognized as dummies by the zero sequence number
++        return 0;
++      }
++
++      capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
++        auto next_frame = std::chrono::steady_clock::now();
++
++        sleep_overshoot_logger.reset();
++
++        while (true) {
++          platf::handle_pacing(next_frame, delay, sleep_overshoot_logger);
++
++          std::shared_ptr<platf::img_t> img_out;
++          auto status = snapshot(pull_free_image_cb, img_out, *cursor);
++          switch (status) {
++            case capture_e::reinit:
++            case capture_e::capture_error:
++            case capture_e::interrupted:
++              return status;
++            case capture_e::timeout:
++              if (!push_captured_image_cb(std::move(img_out), false)) {
++                return capture_e::ok;
++              }
++              break;
++            case capture_e::ok:
++              if (!push_captured_image_cb(std::move(img_out), true)) {
++                return capture_e::ok;
++              }
++              break;
++            default:
++              return status;
++          }
++        }
++      }
++
++    private:
++      capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, bool cursor) {
++        if (!pull_free_image_cb(img_out)) {
++          return capture_e::interrupted;
++        }
++        auto img = (egl::img_descriptor_t *) img_out.get();
++        img->reset();
++
++        wbs_scanout_t so;
++        std::uint64_t generation = 0;
++        int fd = stream_t::get().dup_scanout(so, generation);
++        if (fd < 0) {
++          img->sequence = 0;
++          img->data = nullptr;
++          return capture_e::timeout;
++        }
++
++        // A new guest resolution needs a new encoder.
++        if (static_cast<int>(so.w) != width || static_cast<int>(so.h) != height ||
++            static_cast<int>(so.x) != img_offset_x || static_cast<int>(so.y) != img_offset_y) {
++          close(fd);
++          BOOST_LOG(info) << "QEMU stream: guest screen changed to "sv << so.w << 'x' << so.h;
++          return capture_e::reinit;
++        }
++
++        img->sd.width = static_cast<int>(so.width);
++        img->sd.height = static_cast<int>(so.height);
++        img->sd.fds = {fd, -1, -1, -1};
++        img->sd.fourcc = so.fourcc;
++        img->sd.modifier = so.modifier;
++        img->sd.pitches = {so.stride, 0, 0, 0};
++        img->sd.offsets = {0, 0, 0, 0};
++        img->y_invert = so.y0_top != 0;
++        // Re-import only when QEMU switched buffers; an import reads the
++        // buffer live, so a re-rendered buffer needs none.
++        img->sequence = generation;
++        img->frame_timestamp = std::chrono::steady_clock::now();
++
++        if (cursor) {
++          stream_t::get().load_cursor(*img);
++        } else {
++          img->data = nullptr;
++        }
++
++        return capture_e::ok;
++      }
++
++      mem_type_e mem_type;
++      std::chrono::nanoseconds delay {};
++      int img_offset_x = 0;
++      int img_offset_y = 0;
++    };
++
++    // Moonlight sends 120 units per wheel notch; QEMU takes whole notches.
++    std::mutex scroll_mutex;
++    int scroll_rest_v = 0;
++    int scroll_rest_h = 0;
++
++    void send_wheel(int &rest, int high_res_distance, bool horizontal) {
++      int notches;
++      {
++        std::lock_guard lock {scroll_mutex};
++        rest += high_res_distance;
++        notches = rest / 120;
++        rest -= notches * 120;
++      }
++      if (notches) {
++        wbs_wheel_t wheel {horizontal ? 0 : notches, horizontal ? notches : 0};
++        stream_t::get().send(WBS_WHEEL, &wheel, sizeof(wheel));
++      }
++    }
++  }  // namespace
++
++  bool enabled() {
++    const char *path = std::getenv("WINBOX_STREAM_SOCKET");
++    return path && *path;
++  }
++
++  std::vector<std::string> display_names() {
++    if (!enabled()) {
++      return {};
++    }
++    // Start connecting early, so the first stream finds the guest's screen.
++    stream_t::get();
++    return {"WinBox"s};
++  }
++
++  std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const ::video::config_t &config) {
++    if (hwdevice_type != mem_type_e::cuda) {
++      BOOST_LOG(debug) << "QEMU stream: skipping non-CUDA encoder"sv;
++      return nullptr;
++    }
++
++    auto disp = std::make_shared<display_vram_t>(hwdevice_type);
++    if (disp->init(display_name, config)) {
++      return nullptr;
++    }
++    return disp;
++  }
++
++  void move_mouse(int delta_x, int delta_y) {
++    wbs_rel_t rel {delta_x, delta_y};
++    stream_t::get().send(WBS_REL, &rel, sizeof(rel));
++  }
++
++  void abs_mouse(const touch_port_t &touch_port, float x, float y) {
++    float offset_x = static_cast<float>(touch_port.env_offset_x);
++    float offset_y = static_cast<float>(touch_port.env_offset_y);
++    float w = static_cast<float>(touch_port.width);
++    float h = static_cast<float>(touch_port.height);
++
++    if (touch_port.logical_width > 0 && touch_port.logical_height > 0) {
++      offset_x = static_cast<float>(touch_port.offset_x);
++      offset_y = static_cast<float>(touch_port.offset_y);
++      w = static_cast<float>(touch_port.logical_width);
++      h = static_cast<float>(touch_port.logical_height);
++    }
++    if (w <= 1 || h <= 1) {
++      return;
++    }
++
++    const float nx = std::clamp((x - offset_x) / (w - 1), 0.0f, 1.0f);
++    const float ny = std::clamp((y - offset_y) / (h - 1), 0.0f, 1.0f);
++    wbs_abs_t abs {
++      static_cast<std::uint32_t>(nx * WBS_ABS_MAX + 0.5f),
++      static_cast<std::uint32_t>(ny * WBS_ABS_MAX + 0.5f),
++    };
++    stream_t::get().send(WBS_ABS, &abs, sizeof(abs));
++  }
++
++  void button_mouse(int button, bool release) {
++    wbs_button_t msg {static_cast<std::uint32_t>(button), release ? 0u : 1u};
++    stream_t::get().send(WBS_BUTTON, &msg, sizeof(msg));
++  }
++
++  void scroll(int high_res_distance) {
++    send_wheel(scroll_rest_v, high_res_distance, false);
++  }
++
++  void hscroll(int high_res_distance) {
++    send_wheel(scroll_rest_h, high_res_distance, true);
++  }
++
++  void keyboard_update(std::uint16_t modcode, bool release, bool extended) {
++    wbs_key_t key {modcode, (release ? 0u : WBS_KEY_DOWN) | (extended ? WBS_KEY_EXTENDED : 0u)};
++    stream_t::get().send(WBS_KEY, &key, sizeof(key));
++  }
++}  // namespace platf::qemu
+diff --git a/src/platform/virtualhid_input.cpp b/src/platform/virtualhid_input.cpp
+index 7e255df..7430032 100644
+--- a/src/platform/virtualhid_input.cpp
++++ b/src/platform/virtualhid_input.cpp
+@@ -22,6 +22,9 @@
+ #include "src/config.h"
+ #include "src/logging.h"
+ #include "virtualhid_input.h"
++#ifdef SUNSHINE_BUILD_QEMU
++  #include "src/platform/linux/qemu_stream.h"
++#endif
+ 
+ using namespace std::literals;
+ 
+@@ -1152,30 +1155,72 @@ namespace platf {
+ #endif
+ 
+   void move_mouse(input_t &input, int deltaX, int deltaY) {
++#ifdef SUNSHINE_BUILD_QEMU
++    if (qemu::enabled()) {
++      qemu::move_mouse(deltaX, deltaY);
++      return;
++    }
++#endif
+     virtualhid::move_mouse(virtualhid::get_input_context(input), deltaX, deltaY);
+   }
+ 
+   void move_mouse(input_t &input, const touch_port_t &touch_port, int deltaX, int deltaY) {
++#ifdef SUNSHINE_BUILD_QEMU
++    if (qemu::enabled()) {
++      qemu::move_mouse(deltaX, deltaY);
++      return;
++    }
++#endif
+     virtualhid::move_mouse(virtualhid::get_input_context(input), touch_port, deltaX, deltaY);
+   }
+ 
+   void abs_mouse(input_t &input, const touch_port_t &touch_port, float x, float y) {
++#ifdef SUNSHINE_BUILD_QEMU
++    if (qemu::enabled()) {
++      qemu::abs_mouse(touch_port, x, y);
++      return;
++    }
++#endif
+     virtualhid::abs_mouse(virtualhid::get_input_context(input), touch_port, x, y);
+   }
+ 
+   void button_mouse(input_t &input, int button, bool release) {
++#ifdef SUNSHINE_BUILD_QEMU
++    if (qemu::enabled()) {
++      qemu::button_mouse(button, release);
++      return;
++    }
++#endif
+     virtualhid::button_mouse(virtualhid::get_input_context(input), button, release);
+   }
+ 
+   void scroll(input_t &input, int high_res_distance) {
++#ifdef SUNSHINE_BUILD_QEMU
++    if (qemu::enabled()) {
++      qemu::scroll(high_res_distance);
++      return;
++    }
++#endif
+     virtualhid::scroll(virtualhid::get_input_context(input), high_res_distance);
+   }
+ 
+   void hscroll(input_t &input, int high_res_distance) {
++#ifdef SUNSHINE_BUILD_QEMU
++    if (qemu::enabled()) {
++      qemu::hscroll(high_res_distance);
++      return;
++    }
++#endif
+     virtualhid::hscroll(virtualhid::get_input_context(input), high_res_distance);
+   }
+ 
+   void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags, bool extended) {
++#ifdef SUNSHINE_BUILD_QEMU
++    if (qemu::enabled()) {
++      qemu::keyboard_update(modcode, release, extended);
++      return;
++    }
++#endif
+     virtualhid::keyboard_update(virtualhid::get_input_context(input), modcode, release, flags, extended);
+   }
+ 

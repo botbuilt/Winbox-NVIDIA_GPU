@@ -5,7 +5,14 @@ by pushing a `vX.Y.Z` tag.
 
 ## Unreleased
 
-First public version.
+First public version, as **WinBox NVIDIA GPU** (`ghcr.io/botbuilt/winbox-nvidia-gpu`).
+
+- Moonlight streaming encoded on the GPU (`STREAM=Y`): Sunshine in the
+  container takes Windows' screen straight from QEMU and encodes it with
+  NVENC, with keyboard, mouse and sound. Built with CUDA 12.9 so Pascal
+  cards keep working.
+- QEMU reads frames back for the web console only while it is open, and the
+  virtual monitor's refresh rate can be set (`refresh_rate=`).
 
 - Windows in a container for Unraid, based on dockurr/windows, with an
   Unraid startup hook, healthcheck, backup, snapshot and clean-shutdown

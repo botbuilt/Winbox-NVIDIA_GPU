@@ -1,8 +1,9 @@
 # Example for Unraid (Compose Manager plugin) or any Linux host with KVM.
-# Set up for a shared Nvidia GPU with Triton; paths follow Unraid conventions.
+# Set up for a shared NVIDIA GPU (Triton for DirectX 11, Sunshine for
+# Moonlight streaming); paths follow Unraid conventions.
 services:
   winbox:
-    image: ghcr.io/botbuilt/winbox-triton:latest
+    image: ghcr.io/botbuilt/winbox-nvidia-gpu:latest
     build: .
     container_name: WinBox             # the User Scripts expect this name
     runtime: nvidia                         # remove for Intel/AMD or no GPU
@@ -19,6 +20,8 @@ services:
       NVIDIA_VISIBLE_DEVICES: "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # Plugins > Nvidia Driver
       NVIDIA_DRIVER_CAPABILITIES: "all"
       VRAM_SIZE: "4G"
+      AUDIO: "Y"                            # sound in the web console and Moonlight
+      STREAM: "N"                           # Y = Moonlight streaming, encoded on the GPU (NVENC)
       # USB_PASSTHROUGH: "046d:c52b"
     devices:
       - /dev/kvm
@@ -31,6 +34,12 @@ services:
       - 8006:8006                           # web console
       - 3389:3389/tcp                       # RDP
       - 3389:3389/udp
+      # Sunshine, with STREAM=Y (web UI for pairing on 47990):
+      - 47984:47984/tcp
+      - 47989:47989/tcp
+      - 47990:47990/tcp
+      - 48010:48010/tcp
+      - 47998-48000:47998-48000/udp
     volumes:
       - /mnt/cache/domains/windows:/storage # Windows system disk (pool path, not /mnt/user)
       - /mnt/user/windows-share:/shared     # appears as Z: in Windows
