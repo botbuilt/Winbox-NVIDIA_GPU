@@ -55,6 +55,7 @@ HOST_KERNEL="${HOOK_KERNEL:-$(uname -r)}"
 LIBROOT="${HOOK_LIBROOT:-}"
 HOSTLIBS="${HOOK_HOSTLIBS:-/run/nvidia-host}"
 DOCKER_CFG="${HOOK_DOCKER_CFG:-/run/unraid/docker.cfg}"
+SHADER_CACHE="${HOOK_SHADER_CACHE:-/storage/.nvcache}"
 STREAM_SOCKET="${HOOK_STREAM_SOCKET:-/run/winbox-stream.sock}"
 STREAM_AUDIO_SOCKET="${HOOK_STREAM_AUDIO_SOCKET:-/run/shm/audio.sock}"   # upstream's audio relay
 STREAM_CONFIG="${HOOK_STREAM_CONFIG:-/storage}"
@@ -537,6 +538,26 @@ startStream() {
   hookInfo "Streaming with Sunshine on the GPU (NVENC). Pair Moonlight once in Sunshine's web UI on port 47990. Log: $STREAM_LOG"
 }
 
+# Defaults for the host side of the shared GPU. QEMU and its GPU helpers
+# (one virgl-<n>-... process per Windows program that uses Direct3D) inherit
+# them; a value set in the template wins.
+rendererDefaults() {
+
+  # Nvidia's cache of compiled shaders lives in the container by default and
+  # is lost whenever Unraid re-creates it, so games recompile and stutter.
+  # Keep it with the Windows disk, up to 4 GB (the oldest shaders go first).
+  if [ -z "${__GL_SHADER_DISK_CACHE_PATH:-}" ] && mkdir -p "$SHADER_CACHE" 2>/dev/null; then
+    export __GL_SHADER_DISK_CACHE_PATH="$SHADER_CACHE"
+    export __GL_SHADER_DISK_CACHE_SIZE="${__GL_SHADER_DISK_CACHE_SIZE:-4294967296}"
+  fi
+
+  # Every helper starts a shader compiler thread per CPU core, and glibc gives
+  # each busy thread its own malloc arena, which keeps freed memory around.
+  # With 20 or more helpers that adds up to gigabytes of host RAM.
+  export DXVK_CONFIG="${DXVK_CONFIG:-dxvk.numCompilerThreads = 2}"
+  export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+}
+
 unraidHook() {
 
   local extra=""
@@ -546,6 +567,7 @@ unraidHook() {
 
   if hookEnabled "$GPU"; then
     sharedGpuCheck
+    rendererDefaults
   elif [[ "${VGA:-}" == *gl* ]]; then
     # The image defaults to Triton's virtio-vga-gl, which needs the shared
     # GPU. Without it, fall back to a plain virtio display.

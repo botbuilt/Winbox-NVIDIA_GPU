@@ -231,6 +231,16 @@ Fewer helpers: turn off Widgets, Edge "Startup boost" and "Continue running
 background apps", unneeded startup apps, and sign out of Remote Desktop
 instead of only disconnecting.
 
+Smaller helpers: WinBox starts every helper with at most 2 shader compiler
+threads (`DXVK_CONFIG=dxvk.numCompilerThreads = 2`) and with glibc's spare
+memory shared between threads (`MALLOC_ARENA_MAX=2`). By default each helper
+would start a compiler thread per CPU core, each keeping freed memory of its
+own. Set either variable in the template to override it.
+
+Nvidia's compiled shaders are kept in `<storage>/.nvcache` (up to 4 GB), so
+games don't recompile them (and stutter) after the container is updated or
+re-created. Backups and snapshots leave that folder out.
+
 ## Streaming with Moonlight
 
 With **Moonlight streaming** (`STREAM=Y`), Sunshine starts in the container

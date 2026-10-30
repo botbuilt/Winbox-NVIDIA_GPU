@@ -95,12 +95,13 @@ rm -f "$FAKE/calls.log"
 env DOCKER="$FAKE/docker" FAKE_DIR="$FAKE" FAKE_RUNNING=false bash "$ROOT/scripts/winbox-array-stop.sh" > "$FAKE/out" 2>&1
 ok "array stop skips a stopped container" "! grep -q '^stop' '$FAKE/calls.log'"
 
-# Backups leave snapshots out.
+# Backups leave snapshots and the shader cache out.
 reset
-mkdir -p "$FAKE/storage/snapshots/20240101-000000"
+mkdir -p "$FAKE/storage/snapshots/20240101-000000" "$FAKE/storage/.nvcache"
 backup FAKE_RUNNING=false
 dir=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d | head -1)
 ok "backup skips snapshots" "[ ! -e '$dir/snapshots' ] && [ -f '$dir/data.img' ]"
+ok "backup skips the shader cache" "[ ! -e '$dir/.nvcache' ]"
 
 # Snapshots.
 snap() {
@@ -110,6 +111,7 @@ snap() {
 S="$FAKE/storage/snapshots"
 
 reset
+mkdir -p "$FAKE/storage/.nvcache"
 SNAPENV=(FAKE_RUNNING=true)
 snap create before-update; rc=$?
 name=$(find "$S" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | head -1)
@@ -117,6 +119,7 @@ ok "snapshot succeeds" "[[ $rc -eq 0 ]]"
 ok "snapshot is named with the label" "[[ '$name' == *-before-update ]]"
 ok "snapshot has the disk and vars" "[ -f '$S/$name/data.img' ] && [ -f '$S/$name/windows.vars' ]"
 ok "snapshot skips the iso" "[ ! -e '$S/$name/win11x64.iso' ]"
+ok "snapshot skips the shader cache" "[ ! -e '$S/$name/.nvcache' ]"
 ok "snapshot stops then starts" "grep -q '^stop -t 150 WinBox' '$FAKE/calls.log' && grep -q '^start WinBox' '$FAKE/calls.log'"
 
 snap list
@@ -135,6 +138,7 @@ ok "restore succeeds" "[[ $rc -eq 0 ]]"
 ok "restore brings back the old vars" "[[ \$(cat '$FAKE/storage/windows.vars') == vars ]]"
 ok "restore removes files made after the snapshot" "[ ! -e '$FAKE/storage/extra.img' ]"
 ok "restore keeps the iso" "[ -f '$FAKE/storage/win11x64.iso' ]"
+ok "restore keeps the shader cache" "[ -d '$FAKE/storage/.nvcache' ]"
 undo=$(find "$S" -mindepth 1 -maxdepth 1 -type d -name '*-before-restore' -printf '%f\n' | head -1)
 ok "restore saves the previous state" "[ -n '$undo' ] && [[ \$(cat '$S/$undo/windows.vars') == changed ]]"
 ok "restore restarts Windows" "grep -q '^start WinBox' '$FAKE/calls.log'"
