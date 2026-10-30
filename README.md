@@ -206,8 +206,9 @@ Three things use host RAM, and only the first is `RAM_SIZE`:
    (Explorer, Start, Search, Edge and every WebView app), and a Remote
    Desktop session adds its own set.
 
-Windows only grows into `RAM_SIZE` as it runs, so a setting that is too big
-works for a while and then fails. If everything adds up to more than the
+Windows only grows into `RAM_SIZE` as it runs, and a helper is added for
+every program that starts using the GPU (often 300-500 MB each), so a setup
+that is too big works for a while and then fails. If everything adds up to more than the
 server has, Linux kills the biggest process, which is Windows (`dmesg` shows
 `Out of memory: Killed process … (windows)`), or Unraid itself can freeze.
 The template therefore caps the whole container with
