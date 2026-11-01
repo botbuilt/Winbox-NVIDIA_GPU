@@ -13,6 +13,10 @@ First public version, as **WinBox NVIDIA GPU** (`ghcr.io/botbuilt/winbox-nvidia-
   cards keep working.
 - QEMU reads frames back for the web console only while it is open, and the
   virtual monitor's refresh rate can be set (`refresh_rate=`).
+- Smaller GPU helpers (2 shader compiler threads, `MALLOC_ARENA_MAX=2`), and
+  Nvidia's shader cache kept with the Windows disk so games don't recompile
+  after an update. The README explains how to size `RAM_SIZE` and the
+  memory cap.
 
 - Windows in a container for Unraid, based on dockurr/windows, with an
   Unraid startup hook, healthcheck, backup, snapshot and clean-shutdown

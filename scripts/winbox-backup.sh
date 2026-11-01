@@ -42,7 +42,7 @@ trap restart EXIT
 
 mkdir -p "$DEST" || fail "Cannot create $DEST."
 
-need=$(du -sk --exclude='*.iso' --exclude=snapshots "$storage" | awk '{print $1}')
+need=$(du -sk --exclude='*.iso' --exclude=snapshots --exclude=.nvcache "$storage" | awk '{print $1}')
 free=$(df -Pk "$DEST" | awk 'NR==2 {print $4}')
 if (( need > free )); then
   fail "Not enough space in $DEST: need $((need / 1024 / 1024)) GB, have $((free / 1024 / 1024)) GB."
@@ -60,7 +60,7 @@ log "Copying $storage to $target."
 # Sparse copy keeps the empty parts of the disk image empty; reflink makes it
 # near-instant when source and destination are on the same btrfs/xfs pool.
 mkdir -p "$partial" || fail "Cannot create $partial."
-if ! find "$storage" -mindepth 1 -maxdepth 1 ! -name '*.iso' ! -name snapshots \
+if ! find "$storage" -mindepth 1 -maxdepth 1 ! -name '*.iso' ! -name snapshots ! -name .nvcache \
        -exec cp -a --sparse=always --reflink=auto {} "$partial/" \; ; then
   rm -rf "$partial"
   fail "Copy failed, nothing was kept."
