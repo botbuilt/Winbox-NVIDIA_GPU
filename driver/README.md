@@ -28,6 +28,13 @@ inputs and these changes:
   command ring 1 ms after its last command, so nearly every frame had to
   wake it again through the kernel driver. It now keeps watching for 8 ms.
   The `NPT_RING_IDLE_MS` environment variable (1 to 100) overrides that.
+- [`patches/mesa/0004`](patches/mesa/0004-release-imported-textures.patch),
+  **Leaked window textures (test).** When the desktop compositor (DWM)
+  stopped using another program's window surface, the driver skipped
+  freeing it if a sync step failed first. The surface and its texture on
+  the host GPU then stayed allocated, so DWM's shared GPU memory and the
+  host's video memory grew until the host ran out of RAM. The driver now
+  frees it anyway and logs how many such surfaces each process holds open.
 - [`patches/kmd/0001`](patches/kmd/0001-win10-paging-buffer-segment.patch),
   **Windows 10.** The driver puts its paging buffers in system memory.
   Windows 11 accepts that, but Windows 10's video memory manager
