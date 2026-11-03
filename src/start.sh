@@ -45,6 +45,7 @@ set -Eeuo pipefail
 : "${RENDERNODE:=""}"
 : "${ALLOW_WEAK_PASSWORD:="N"}"
 : "${STREAM:="N"}"
+: "${GPU_MEMORY:=""}"
 : "${USER_PORTS:=""}"
 : "${HOST_PORTS:=""}"
 
@@ -56,6 +57,8 @@ LIBROOT="${HOOK_LIBROOT:-}"
 HOSTLIBS="${HOOK_HOSTLIBS:-/run/nvidia-host}"
 DOCKER_CFG="${HOOK_DOCKER_CFG:-/run/unraid/docker.cfg}"
 SHADER_CACHE="${HOOK_SHADER_CACHE:-/storage/.nvcache}"
+NVSMI="${HOOK_NVSMI:-nvidia-smi}"
+GPU_MEMORY_SPARE=2048   # MB of the card left for Windows' desktop, Sunshine and other containers
 STREAM_SOCKET="${HOOK_STREAM_SOCKET:-/run/winbox-stream.sock}"
 STREAM_AUDIO_SOCKET="${HOOK_STREAM_AUDIO_SOCKET:-/run/shm/audio.sock}"   # upstream's audio relay
 STREAM_CONFIG="${HOOK_STREAM_CONFIG:-/storage}"
@@ -554,8 +557,44 @@ rendererDefaults() {
   # Every helper starts a shader compiler thread per CPU core, and glibc gives
   # each busy thread its own malloc arena, which keeps freed memory around.
   # With 20 or more helpers that adds up to gigabytes of host RAM.
-  export DXVK_CONFIG="${DXVK_CONFIG:-dxvk.numCompilerThreads = 2}"
+  # A game sees the whole card and fills it, but the card is shared. Past
+  # its size the Nvidia driver moves the rest into the host's RAM, outside
+  # any container limit, until the host runs out and kills Windows. So
+  # games see the card minus a spare (GPU_MEMORY overrides, N turns it off).
+  local dxvk="dxvk.numCompilerThreads = 2" mb
+  mb="$(gpuMemoryLimit)"
+  if [ -n "$mb" ]; then
+    dxvk+="; dxgi.maxDeviceMemory = $mb; dxvk.maxMemoryBudget = $mb"
+    hookInfo "Games see ${mb} MB of GPU memory (GPU_MEMORY changes it)."
+  fi
+  export DXVK_CONFIG="${DXVK_CONFIG:-$dxvk}"
   export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+}
+
+# GPU memory in MB that games may use, or nothing for no limit.
+gpuMemoryLimit() {
+
+  local total
+
+  case "${GPU_MEMORY,,}" in
+    n | no | off | 0) return 0 ;;
+  esac
+
+  if [[ "$GPU_MEMORY" =~ ^[0-9]+$ ]]; then
+    echo "$GPU_MEMORY"
+    return 0
+  fi
+
+  [ -n "$GPU_MEMORY" ] && hookWarn "GPU_MEMORY='$GPU_MEMORY' is not a number of MB, using the default."
+
+  total="$("$NVSMI" --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -dc '0-9')"
+  [ -z "$total" ] && return 0
+
+  if (( total - GPU_MEMORY_SPARE >= 1024 )); then
+    echo "$(( total - GPU_MEMORY_SPARE ))"
+  else
+    echo "$(( total / 2 ))"
+  fi
 }
 
 unraidHook() {

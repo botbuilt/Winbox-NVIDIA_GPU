@@ -201,7 +201,11 @@ Three things use host RAM, and only the first is `RAM_SIZE`:
 
 1. Windows itself (`RAM_SIZE`).
 2. The GPU memory window (`VRAM_SIZE`, 4G by default).
-3. One helper process (`virgl-<n>-…`, started by `virgl_render_server`) for
+3. Graphics card memory that overflows. A game sees the card's full size
+   and fills it, but the card is shared. Past its size, the Nvidia driver
+   moves the rest into host RAM, where no container limit applies (see
+   [GPU memory for games](#gpu-memory-for-games)).
+4. One helper process (`virgl-<n>-…`, started by `virgl_render_server`) for
    every Windows program that uses the GPU. Windows 11 has 15-25 of those on a normal desktop
    (Explorer, Start, Search, Edge and every WebView app), and a Remote
    Desktop session adds its own set.
@@ -232,10 +236,23 @@ background apps", unneeded startup apps, and sign out of Remote Desktop
 instead of only disconnecting.
 
 Smaller helpers: WinBox starts every helper with at most 2 shader compiler
-threads (`DXVK_CONFIG=dxvk.numCompilerThreads = 2`) and with glibc's spare
+threads (`dxvk.numCompilerThreads = 2` in `DXVK_CONFIG`) and with glibc's spare
 memory shared between threads (`MALLOC_ARENA_MAX=2`). By default each helper
 would start a compiler thread per CPU core, each keeping freed memory of its
-own. Set either variable in the template to override it.
+own. Set either variable in the template to override it; a `DXVK_CONFIG`
+of your own replaces all of WinBox's DXVK defaults, the GPU memory limit
+included.
+
+### GPU memory for games
+
+WinBox tells games the card is 2 GB smaller than it is
+(`dxgi.maxDeviceMemory` and `dxvk.maxMemoryBudget` in `DXVK_CONFIG`), so
+the Windows desktop, Sunshine and other containers keep room on it and a
+game doesn't spill into host RAM. The log shows the value at start
+("Games see 6144 MB of GPU memory" on an 8 GB card). Set **GPU memory for
+games** (`GPU_MEMORY`) to a number of MB to change it, or `N` for no limit.
+To watch the card, run `nvidia-smi` on Unraid: one `virgl_render_server`
+line per Windows program, with its GPU memory.
 
 Nvidia's compiled shaders are kept in `<storage>/.nvcache` (up to 4 GB), so
 games don't recompile them (and stutter) after the container is updated or
@@ -444,7 +461,7 @@ The startup hook stops with a clear message when something is missing:
 | `no completion in 30s, retiring as device-lost` | The GPU stopped answering and Windows reset it. Often memory: see [Memory](#memory) |
 | `Memory allocation failed` / `Failed to import ... dmabuf` (Nvidia) | Don't pass `/dev/udmabuf` into the container; Nvidia can't import it. The warning `open /dev/udmabuf: No such file or directory` is expected and harmless |
 | `Killed` / `QEMU exited unexpectedly` | The container hit its `--memory` cap; see [Memory](#memory) |
-| Container stops after a while; `dmesg` shows `Out of memory: Killed process … (windows)` | Unraid ran out of RAM. Lower `RAM_SIZE` and the cap; see [Memory](#memory) |
+| Container stops after a while; `dmesg` shows `Out of memory: Killed process … (windows)` | Unraid ran out of RAM. If `nvidia-smi` showed the card full first, lower **GPU memory for games**; otherwise lower `RAM_SIZE` and the cap. See [Memory](#memory) |
 | `KVM acceleration is not available` | Turn on VT-x/AMD-V in the BIOS |
 | `PASSWORD is empty or a well-known default` | Set a real password in the template |
 | Container shows **unhealthy** | QEMU stopped or the web console is down; check the log |

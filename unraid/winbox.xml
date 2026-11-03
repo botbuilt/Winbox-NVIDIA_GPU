@@ -56,6 +56,7 @@
   <Config Name="Nvidia GPU UUID" Target="NVIDIA_VISIBLE_DEVICES" Default="" Mode="" Description="UUID of the Nvidia GPU from Plugins &gt; Nvidia Driver (starts with GPU-), or 'all'. The same GPU can be given to Plex, Jellyfin and others." Type="Variable" Display="always" Required="false" Mask="false"/>
   <Config Name="Nvidia capabilities" Target="NVIDIA_DRIVER_CAPABILITIES" Default="all" Mode="" Description="Must include graphics and display. Leave at 'all'." Type="Variable" Display="advanced" Required="false" Mask="false">all</Config>
   <Config Name="GPU memory budget" Target="VRAM_SIZE" Default="4G" Mode="" Description="Video memory Windows may use on the shared GPU, as a power of two (2G, 4G, 8G). Leave room for the other containers." Type="Variable" Display="advanced" Required="false" Mask="false">4G</Config>
+  <Config Name="GPU memory for games" Target="GPU_MEMORY" Default="" Mode="" Description="Optional. MB of graphics card memory Windows games may use. Empty = the card's size minus 2 GB, so a game can't overflow the shared card into Unraid's RAM. N = no limit." Type="Variable" Display="advanced" Required="false" Mask="false"/>
   <Config Name="Render node" Target="RENDERNODE" Default="" Mode="" Description="Optional. Picked automatically, preferring the Nvidia card. Set it, for example /dev/dri/renderD128, to choose a specific GPU." Type="Variable" Display="advanced" Required="false" Mask="false"/>
 
   <!-- Moonlight streaming: Sunshine in the container, video encoded on the shared GPU (NVENC) -->

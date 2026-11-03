@@ -290,6 +290,31 @@ out=$(env -i PATH="$PATH" UNRAID_HOOK_TEST=Y HOOK_SHADER_CACHE=/proc/no-such/.nv
 expect "unwritable cache folder leaves the driver default" "$out" "CACHE=unset"$'\n'
 
 
+printf '#!/bin/sh\necho "${FAKE_VRAM:-8192}"\n' > "$FAKE/nvsmi"; chmod +x "$FAKE/nvsmi"
+gpuMem() {
+  env -i PATH="$PATH" UNRAID_HOOK_TEST=Y HOOK_SHADER_CACHE="$FAKE/storage/.nvcache" \
+    HOOK_NVSMI="$FAKE/nvsmi" "$@" bash -c 'source "$0"
+    rendererDefaults
+    printf "DXVK=%s\n" "$DXVK_CONFIG"' "$HOOK" 2>&1
+}
+out=$(gpuMem)
+expect "games see the card minus 2 GB" "$out" "DXVK=dxvk.numCompilerThreads = 2; dxgi.maxDeviceMemory = 6144; dxvk.maxMemoryBudget = 6144"$'\n'
+expect "the limit is announced" "$out" "Games see 6144 MB"
+out=$(gpuMem FAKE_VRAM=2048)
+expect "a small card keeps half" "$out" "dxgi.maxDeviceMemory = 1024;"
+out=$(gpuMem GPU_MEMORY=4096)
+expect "GPU_MEMORY sets the limit" "$out" "dxgi.maxDeviceMemory = 4096; dxvk.maxMemoryBudget = 4096"$'\n'
+out=$(gpuMem GPU_MEMORY=N)
+expect "GPU_MEMORY=N turns the limit off" "$out" "DXVK=dxvk.numCompilerThreads = 2"$'\n'
+out=$(gpuMem GPU_MEMORY=lots)
+expect "a bad GPU_MEMORY warns" "$out" "GPU_MEMORY='lots' is not a number"
+expect "and falls back to the default" "$out" "dxgi.maxDeviceMemory = 6144;"
+out=$(gpuMem HOOK_NVSMI=/nonexistent)
+expect "no nvidia-smi, no limit" "$out" "DXVK=dxvk.numCompilerThreads = 2"$'\n'
+out=$(gpuMem DXVK_CONFIG="dxvk.hud = fps")
+expect "a template DXVK_CONFIG still wins" "$out" "DXVK=dxvk.hud = fps"$'\n'
+
+
 # --- Streaming ----------------------------------------------------------------
 
 out=$(runHook STREAM=Y GPU=Y "${NV[@]}")
