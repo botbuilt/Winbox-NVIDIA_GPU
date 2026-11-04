@@ -1,20 +1,21 @@
 diff --git a/src/virtio/neptune/triton/triton.h b/src/virtio/neptune/triton/triton.h
-index a7d5e6c..698e571 100644
+index a7d5e6c..bb483d3 100644
 --- a/src/virtio/neptune/triton/triton.h
 +++ b/src/virtio/neptune/triton/triton.h
-@@ -310,6 +310,10 @@ typedef struct TRITON_RESOURCE {
+@@ -310,6 +310,11 @@ typedef struct TRITON_RESOURCE {
      D3DKMT_HANDLE          hImportAlloc;
      D3DKMT_HANDLE          hImportResKmt;
  
 +    /* VRAM accounting allocation (tritonKmCreateAccountAlloc) that makes
 +     * Windows count this host-only resource's memory; 0 when uncounted. */
 +    D3DKMT_HANDLE          hAccountAlloc;
++    UINT64                 AccountBytes;
 +
      ID3D11Resource        *pResource;
  
      /* Single-sample, single-mip, single-slice shared texture a back buffer of
 diff --git a/src/virtio/neptune/triton/tritonKm.c b/src/virtio/neptune/triton/tritonKm.c
-index 4a359d5..58b3b2a 100644
+index 4a359d5..78150ca 100644
 --- a/src/virtio/neptune/triton/tritonKm.c
 +++ b/src/virtio/neptune/triton/tritonKm.c
 @@ -120,14 +120,14 @@ tritonKmLoadFence(volatile const UINT64 *va)
@@ -54,7 +55,7 @@ index 4a359d5..58b3b2a 100644
        return;
  
     D3DDDI_MAKERESIDENT mr;
-@@ -241,3 +249,152 @@ tritonKmFillSharedExchange(VIOGPU_CREATE_ALLOCATION_EXCHANGE *ax,
+@@ -241,3 +249,201 @@ tritonKmFillSharedExchange(VIOGPU_CREATE_ALLOCATION_EXCHANGE *ax,
        ax->Size = ((d->Width * d->Height * 4) + 4095) & ~4095ull;
     return TRUE;
  }
@@ -148,14 +149,53 @@ index 4a359d5..58b3b2a 100644
 +   return s == 1;
 +}
 +
++/* Process-wide accounting statistics, reported through OutputDebugString
++ * (DebugView, "Capture Win32") so a user can see whether a game's memory is
++ * being counted and whether it is ever given back:
++ *   - the first few failures of each kind, with the HRESULT;
++ *   - a summary line each time the live counted size crosses another
++ *     256 MB step, up or down. */
++static volatile LONG64 g_AccLive;      /* bytes currently counted */
++static volatile LONG64 g_AccLiveCount; /* allocations currently counted */
++static volatile LONG   g_AccOk, g_AccAllocFail, g_AccResFail, g_AccPending;
++static volatile LONG   g_AccNoQueue, g_AccStep;
++
++#define TRITON_KM_ACCOUNT_LOG_STEP (256ull << 20)
++
++static void
++tritonKmAccountReport(const char *why)
++{
++   const LONG64 live = g_AccLive;
++   const LONG step = (LONG)(live / (LONG64)TRITON_KM_ACCOUNT_LOG_STEP);
++   const LONG prev = InterlockedExchange(&g_AccStep, step);
++   if (why == NULL && prev == step)
++      return;
++   TR_LOG("vram-account pid %lu: %s live %lld MB in %lld allocs; ok %ld, "
++          "pending %ld, alloc failed %ld, resident failed %ld, no queue %ld",
++          (unsigned long)GetCurrentProcessId(), why ? why : "step",
++          (long long)(live >> 20), (long long)g_AccLiveCount, g_AccOk,
++          g_AccPending, g_AccAllocFail, g_AccResFail, g_AccNoQueue);
++}
++
++void
++tritonKmAccountNoteFree(UINT64 bytes)
++{
++   InterlockedAdd64(&g_AccLive, -(LONG64)bytes);
++   InterlockedDecrement64(&g_AccLiveCount);
++   tritonKmAccountReport(NULL);
++}
++
 +D3DKMT_HANDLE
 +tritonKmCreateAccountAlloc(TRITON_KM *km, UINT64 bytes)
 +{
 +   if (bytes < TRITON_KM_ACCOUNT_MIN_BYTES || !km->pCallbacks ||
 +       !km->pCallbacks->pfnAllocateCb || !tritonKmAccountingEnabled())
 +      return 0;
-+   if (!tritonKmEnsurePagingQueue(km))
++   if (!tritonKmEnsurePagingQueue(km)) {
++      if (InterlockedIncrement(&g_AccNoQueue) <= 3)
++         tritonKmAccountReport("no paging queue;");
 +      return 0;
++   }
 +
 +   VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX ax;
 +   memset(&ax, 0, sizeof(ax));
@@ -181,8 +221,10 @@ index 4a359d5..58b3b2a 100644
 +
 +   HRESULT hr = km->pCallbacks->pfnAllocateCb(km->hRTDevice, &cb);
 +   if (FAILED(hr) || !ai.hAllocation) {
-+      TR_LOG_HOT("km: accounting alloc (%llu bytes) failed 0x%08lx",
-+                 (unsigned long long)bytes, (unsigned long)hr);
++      if (InterlockedIncrement(&g_AccAllocFail) <= 4)
++         TR_LOG("vram-account pid %lu: allocate (%llu bytes) failed 0x%08lx",
++                (unsigned long)GetCurrentProcessId(),
++                (unsigned long long)bytes, (unsigned long)hr);
 +      return 0;
 +   }
 +
@@ -196,8 +238,10 @@ index 4a359d5..58b3b2a 100644
 +   mr.AllocationList = &ai.hAllocation;
 +   hr = km->pCallbacks->pfnMakeResidentCb(km->hRTDevice, &mr);
 +   if (FAILED(hr) && hr != E_PENDING) {
-+      TR_LOG_HOT("km: accounting MakeResident (%llu bytes) failed 0x%08lx",
-+                 (unsigned long long)bytes, (unsigned long)hr);
++      if (InterlockedIncrement(&g_AccResFail) <= 4)
++         TR_LOG("vram-account pid %lu: MakeResident (%llu bytes) failed 0x%08lx",
++                (unsigned long)GetCurrentProcessId(),
++                (unsigned long long)bytes, (unsigned long)hr);
 +      D3DDDICB_DEALLOCATE da;
 +      memset(&da, 0, sizeof(da));
 +      da.NumAllocations = 1;
@@ -205,13 +249,19 @@ index 4a359d5..58b3b2a 100644
 +      km->pCallbacks->pfnDeallocateCb(km->hRTDevice, &da);
 +      return 0;
 +   }
++   if (hr == E_PENDING)
++      InterlockedIncrement(&g_AccPending);
++   const LONG ok = InterlockedIncrement(&g_AccOk);
++   InterlockedAdd64(&g_AccLive, (LONG64)bytes);
++   InterlockedIncrement64(&g_AccLiveCount);
++   tritonKmAccountReport(ok == 1 ? "first;" : NULL);
 +   return ai.hAllocation;
 +}
 diff --git a/src/virtio/neptune/triton/tritonKm.h b/src/virtio/neptune/triton/tritonKm.h
-index 879f031..823dd4d 100644
+index 879f031..199a6a7 100644
 --- a/src/virtio/neptune/triton/tritonKm.h
 +++ b/src/virtio/neptune/triton/tritonKm.h
-@@ -55,6 +55,22 @@ HRESULT tritonKmEscape(const TRITON_KM *km, VIOGPU_ESCAPE *esc);
+@@ -55,6 +55,24 @@ HRESULT tritonKmEscape(const TRITON_KM *km, VIOGPU_ESCAPE *esc);
  void    tritonKmEnsureRuntimeCtx(TRITON_KM *km);
  void    tritonKmRequestResidency(TRITON_KM *km, D3DKMT_HANDLE hAllocation);
  
@@ -230,6 +280,8 @@ index 879f031..823dd4d 100644
 + * off (NPT_VRAM_ACCOUNT=0), the resource is small, or anything fails: the
 + * resource then simply goes uncounted. */
 +D3DKMT_HANDLE tritonKmCreateAccountAlloc(TRITON_KM *km, UINT64 bytes);
++/* Counts a freed accounting allocation of `bytes` (as passed to create). */
++void tritonKmAccountNoteFree(UINT64 bytes);
 +
  /* The D3D11 description of a texture being exported as a shared blob. */
  typedef struct TRITON_KM_SHARED_DESC {
@@ -260,18 +312,19 @@ index 8cdbe13..5195a5c 100644
  D3DKMT_HANDLE
  triton12AllocResidencyOnly(PTRITON12_DEVICE p, HANDLE hRTResource)
 diff --git a/src/virtio/neptune/triton/tritonResource.c b/src/virtio/neptune/triton/tritonResource.c
-index e47217f..36b56d5 100644
+index e47217f..890fdb8 100644
 --- a/src/virtio/neptune/triton/tritonResource.c
 +++ b/src/virtio/neptune/triton/tritonResource.c
-@@ -217,6 +217,7 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
+@@ -217,6 +217,8 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
      r->IsShared         = FALSE;
      r->hImportAlloc     = 0;
      r->hImportResKmt    = 0;
 +    r->hAccountAlloc    = 0;
++    r->AccountBytes     = 0;
  
      /* Non-primary TEXTURE2D with MISC_SHARED: emulate the shared handle.
       * Display primaries take the host-swapchain route below.
-@@ -451,6 +452,16 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
+@@ -451,6 +453,19 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
          return;
      }
  
@@ -281,14 +334,17 @@ index e47217f..36b56d5 100644
 +     * grows until the host GPU spills into host RAM.  Count DEFAULT and
 +     * IMMUTABLE resources (the ones that live in VRAM); shared ones already
 +     * own an allocation. */
-+    if (!isShared && (usage == D3D11_USAGE_DEFAULT || usage == D3D11_USAGE_IMMUTABLE))
-+        r->hAccountAlloc = tritonKmCreateAccountAlloc(&pD->Km,
-+                                                      tritonKmEstimateResourceBytes(pArgs));
++    if (!isShared && (usage == D3D11_USAGE_DEFAULT || usage == D3D11_USAGE_IMMUTABLE)) {
++        const UINT64 bytes = tritonKmEstimateResourceBytes(pArgs);
++        r->hAccountAlloc = tritonKmCreateAccountAlloc(&pD->Km, bytes);
++        if (r->hAccountAlloc)
++            r->AccountBytes = bytes;
++    }
 +
      if (isShared) {
          if (!tritonRegisterSharedBlob(pD, r, r->pResource, (UINT)usage, bind,
                                        cpuAccess, misc, r->Format, FALSE))
-@@ -525,6 +536,15 @@ tritonDestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource)
+@@ -525,6 +540,17 @@ tritonDestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource)
          r->pPresentCompanion = NULL;
      }
  
@@ -299,6 +355,8 @@ index e47217f..36b56d5 100644
 +        da.HandleList     = &r->hAccountAlloc;
 +        pD->KTCallbacks.pfnDeallocateCb(pD->hRTDevice.handle, &da);
 +        r->hAccountAlloc = 0;
++        tritonKmAccountNoteFree(r->AccountBytes);
++        r->AccountBytes = 0;
 +    }
 +
      /* Exporter: the KM allocation owns the virtio blob; deallocating it
