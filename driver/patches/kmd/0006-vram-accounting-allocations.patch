@@ -81,7 +81,7 @@ index d56e93b..f4aa987 100644
  
  NTSTATUS
 diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
-index 7105cc9..ef5036b 100644
+index 7105cc9..ef230c0 100644
 --- a/viogpu/viogpu3d/viogpu_adapter.cpp
 +++ b/viogpu/viogpu3d/viogpu_adapter.cpp
 @@ -933,7 +933,7 @@ NTSTATUS VioGpuAdapter::QueryDeviceDescriptor(_In_ ULONG ChildUid, _Inout_ DXGK_
@@ -150,7 +150,7 @@ index 7105cc9..ef5036b 100644
  }
  
  NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQueryAdapterInfo)
-@@ -1149,16 +1192,17 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+@@ -1149,17 +1192,21 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                  }
  
                  DXGK_QUERYSEGMENTOUT3 *pSegmentInfo = (DXGK_QUERYSEGMENTOUT3 *)pQueryAdapterInfo->pOutputData;
@@ -163,14 +163,18 @@ index 7105cc9..ef5036b 100644
                      FillPagingBufferInfo(pSegmentInfo);
                      FillApertureSegment(&pSegmentInfo->pSegmentDescriptor[0]);
 -                    if (nbSegments == 2)
-+                    if (nbSegments == 3)
++                    if (nbSegments >= 2)
                      {
                          FillShmemSegment(&pSegmentInfo->pSegmentDescriptor[1]);
-+                        FillAccountSegment(&pSegmentInfo->pSegmentDescriptor[2]);
                      }
++                    if (nbSegments == 3)
++                    {
++                        FillAccountSegment(&pSegmentInfo->pSegmentDescriptor[2]);
++                    }
                  }
                  DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s Requested segments\n", __FUNCTION__));
-@@ -1182,7 +1226,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 return STATUS_SUCCESS;
+@@ -1182,7 +1229,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                  }
  
                  DXGK_QUERYSEGMENTOUT4 *pSegmentInfo = (DXGK_QUERYSEGMENTOUT4 *)pQueryAdapterInfo->pOutputData;
@@ -179,20 +183,24 @@ index 7105cc9..ef5036b 100644
  
                  // Two-call contract: the first call has NbSegment == 0 (and no
                  // descriptor array); report only the segment count and touch
-@@ -1212,9 +1256,10 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+@@ -1212,10 +1259,14 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                  }
                  RtlZeroMemory(pSegmentInfo->pSegmentDescriptor, stride * nbSegments);
                  FillApertureSegment((DXGK_SEGMENTDESCRIPTOR4 *)pSegmentInfo->pSegmentDescriptor);
 -                if (nbSegments == 2)
-+                if (nbSegments == 3)
++                if (nbSegments >= 2)
                  {
                      FillShmemSegment((DXGK_SEGMENTDESCRIPTOR4 *)(pSegmentInfo->pSegmentDescriptor + stride));
-+                    FillAccountSegment((DXGK_SEGMENTDESCRIPTOR4 *)(pSegmentInfo->pSegmentDescriptor + 2 * stride));
                  }
++                if (nbSegments == 3)
++                {
++                    FillAccountSegment((DXGK_SEGMENTDESCRIPTOR4 *)(pSegmentInfo->pSegmentDescriptor + 2 * stride));
++                }
  
                  DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s Requested segments (v4)\n", __FUNCTION__));
+                 return STATUS_SUCCESS;
 diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
-index 3bc163f..1611755 100644
+index 3bc163f..5a8b9c2 100644
 --- a/viogpu/viogpu3d/viogpu_adapter.h
 +++ b/viogpu/viogpu3d/viogpu_adapter.h
 @@ -79,6 +79,9 @@ struct CAPSET_INFO
@@ -205,9 +213,18 @@ index 3bc163f..1611755 100644
  class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVioGpuPCI
  {
    public:
-@@ -109,6 +112,10 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
+@@ -108,7 +111,19 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
+         return m_PciResources.GetPciBar(m_VioDev.shmem.bar)->GetPA().QuadPart + m_VioDev.shmem.offset;
      }
  
++    ULONGLONG GetShmemLength() {
++        return m_VioDev.shmem.available ? m_VioDev.shmem.length : 0;
++    }
++
++    // Bytes of live VRAM accounting allocations (segment 3), so new ones
++    // are refused before the segment is full; see CreateAllocation.
++    volatile LONG64 m_AccountBytes = 0;
++
      static const ULONGLONG SHMEM_GPU_BASE_VA = 0x700000000;
 +    // Segment 3: GPU address space only (no CPU view, no backing), where the
 +    // UMD's VRAM accounting allocations (VIOGPU_BLOB_FLAG_VRAM_ACCOUNT) live.
@@ -216,7 +233,7 @@ index 3bc163f..1611755 100644
    private:
      DEVICE_OBJECT *m_pPhysicalDevice;
      DXGKRNL_INTERFACE m_DxgkInterface;
-@@ -217,6 +224,7 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
+@@ -217,6 +232,7 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
      VOID DpcRoutine(VOID);
      NTSTATUS QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQueryAdapterInfo);
      template <typename DESC> void FillShmemSegment(DESC *pDesc);
@@ -225,10 +242,35 @@ index 3bc163f..1611755 100644
      NTSTATUS QueryInterface(_In_ CONST PQUERY_INTERFACE QueryInterface);
      NTSTATUS StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
 diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
-index b67507d..fbe58c7 100644
+index b67507d..37151a2 100644
 --- a/viogpu/viogpu3d/viogpu_allocation.cpp
 +++ b/viogpu/viogpu3d/viogpu_allocation.cpp
-@@ -1037,6 +1037,16 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+@@ -366,6 +366,12 @@ void NotifyResourceDestroyed(void *ctx, void *cmd, void *)
+     resIdr->PutId(unref_cmd->resource_id);
+ }
+ 
++void VioGpuAllocation::ChargeAccount(ULONGLONG bytes)
++{
++    m_AccountBytes = bytes;
++    InterlockedAdd64(&m_adapter->m_AccountBytes, (LONG64)bytes);
++}
++
+ VioGpuAllocation::~VioGpuAllocation(void)
+ {
+     // m_DeviceAllocations.clear() invokes ~VioGpuDeviceAllocation, which is
+@@ -374,6 +380,11 @@ VioGpuAllocation::~VioGpuAllocation(void)
+     // lands here at PASSIVE_LEVEL.
+     PAGED_CODE();
+ 
++    if (m_AccountBytes)
++    {
++        InterlockedAdd64(&m_adapter->m_AccountBytes, -(LONG64)m_AccountBytes);
++    }
++
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res_id=%d IsBlob=%d alloc=%p size=%zu\n", __FUNCTION__, m_Id, m_IsBlob, this, m_DeviceAllocations.size()));
+ 
+     // A pending deferred release always holds a reference, so the DPC cannot
+@@ -1037,6 +1048,34 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
          resourceExchange = (VIOGPU_CREATE_ALLOCATION_EXCHANGE *)pCreateAllocation->pPrivateDriverData;
      }
  
@@ -242,10 +284,40 @@ index b67507d..fbe58c7 100644
 +        return STATUS_NOT_SUPPORTED;
 +    }
 +
++    // Refuse accounting allocations once they would fill 7/8 of the
++    // accounting segment.  A full segment leaves VidMm unable to page the
++    // next one in (they can live nowhere else), which removes the device
++    // (DXGI_ERROR_DEVICE_REMOVED in the game).  Past the limit resources
++    // simply go uncounted, as with accounting off; the usage Windows reports
++    // then stays near the budget, which is what makes games trim.
++    ULONGLONG accountBytes = 0;
++    if (resourceExchange->Type == VIOGPU_RESOURCE_TYPE_BLOB &&
++        (resourceExchange->OptionsBlob.blob_flags & VIOGPU_BLOB_FLAG_VRAM_ACCOUNT))
++    {
++        accountBytes = (resourceExchange->Size + PAGE_SIZE - 1) & ~(ULONGLONG)(PAGE_SIZE - 1);
++        const ULONGLONG limit = adapter->GetShmemLength() / 8 * 7;
++        if ((ULONGLONG)adapter->m_AccountBytes + accountBytes > limit)
++        {
++            return STATUS_NOT_SUPPORTED;
++        }
++    }
++
      VioGpuAllocation *allocation = NULL;
  
      switch (resourceExchange->Type) {
-@@ -1206,6 +1216,33 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+@@ -1067,6 +1106,11 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+         return STATUS_NO_MEMORY;
+     }
+ 
++    if (accountBytes)
++    {
++        allocation->ChargeAccount(accountBytes);
++    }
++
+     allocationInfo->hAllocation = allocation->ToHandle();
+     // The lookup cookie rides after the exchange when the authoring side wrote
+     // one; its presence is signalled by the private-data size.  Recording it
+@@ -1206,6 +1250,33 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
                  // allocationInfo->Flags.Swizzled = TRUE;
                  allocationInfo->SupportedReadSegmentSet = 0b10;
                  allocationInfo->SupportedWriteSegmentSet = 0b10;
@@ -279,3 +351,26 @@ index b67507d..fbe58c7 100644
              }
              break;
          case VIOGPU_RESOURCE_TYPE_IMPORT:
+diff --git a/viogpu/viogpu3d/viogpu_allocation.h b/viogpu/viogpu3d/viogpu_allocation.h
+index 1b3f266..e380efb 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.h
++++ b/viogpu/viogpu3d/viogpu_allocation.h
+@@ -155,6 +155,10 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
+         return m_Size;
+     }
+ 
++    // Counts this VRAM accounting allocation in the adapter's total until
++    // the allocation is destroyed.
++    void ChargeAccount(ULONGLONG bytes);
++
+     // Translate a 2D resource coordinate to the attached guest backing
+     // layout used by VIRTIO_GPU_CMD_TRANSFER_{TO,FROM}_HOST_3D.  The box
+     // selects pixels in the host resource; offset independently selects the
+@@ -264,6 +268,7 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
+     void QueueDeferredReleaseWorkItem();
+ 
+     VioGpuAdapter *m_adapter;
++    ULONGLONG m_AccountBytes = 0;
+     UINT m_Id;
+ 
+   public:
