@@ -48,10 +48,12 @@ inputs and these changes:
   the game trims itself. The placeholders live in a new third memory
   segment that stands for the GPU's memory: it is as large as the GPU
   memory window (`VRAM_SIZE`), has no memory behind it and the CPU cannot
-  see it. (A first version put them in the GPU memory window itself;
-  Windows then cleared each one through the CPU, one trapped access at a
-  time, and froze at login.) The segment is still a test and is off by
-  default. The registry value
+  see it. Windows clears every new allocation in such a segment through a
+  GPU address range it reserves with the allocation's alignment; an
+  alignment of 0 is refused there and Windows 10 retried forever, which
+  froze the login, so the placeholders now ask for 4 KB alignment. (A first
+  version put them in the GPU memory window itself and also froze at
+  login.) The segment is still a test and is off by default. The registry value
   `HKLM\SYSTEM\CurrentControlSet\Services\VioGpu3D\Parameters\VramSegmentMode`
   (DWORD, read at boot) turns it on: `1` adds the segment, `2` also reports
   the GPU memory window as system memory so only the new segment counts as

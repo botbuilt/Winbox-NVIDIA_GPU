@@ -225,7 +225,7 @@ index 3bc163f..1611755 100644
      NTSTATUS QueryInterface(_In_ CONST PQUERY_INTERFACE QueryInterface);
      NTSTATUS StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
 diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
-index b67507d..050265a 100644
+index b67507d..fbe58c7 100644
 --- a/viogpu/viogpu3d/viogpu_allocation.cpp
 +++ b/viogpu/viogpu3d/viogpu_allocation.cpp
 @@ -1037,6 +1037,16 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
@@ -245,7 +245,7 @@ index b67507d..050265a 100644
      VioGpuAllocation *allocation = NULL;
  
      switch (resourceExchange->Type) {
-@@ -1206,6 +1216,23 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+@@ -1206,6 +1216,33 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
                  // allocationInfo->Flags.Swizzled = TRUE;
                  allocationInfo->SupportedReadSegmentSet = 0b10;
                  allocationInfo->SupportedWriteSegmentSet = 0b10;
@@ -263,6 +263,16 @@ index b67507d..050265a 100644
 +                    allocationInfo->PreferredSegment.SegmentId0 = VioGpuAdapter::ACCOUNT_SEGMENT_ID;
 +                    allocationInfo->Flags.CpuVisible = FALSE;
 +                    allocationInfo->AllocationPriority = D3DDDI_ALLOCATIONPRIORITY_LOW;
++                    // An explicit alignment is required here.  VidMm zeroes a
++                    // new allocation in a segment the CPU cannot see through
++                    // a GPU virtual address range in the paging process, and
++                    // reserves that range with the allocation's alignment.
++                    // Alignment 0 is rejected there (STATUS_INVALID_PARAMETER
++                    // from CVirtualAddressAllocator::AllocateVirtualAddressRange
++                    // on Windows 10 19045), and VidMm retries forever, which
++                    // froze the login.  CPU-visible allocations are zeroed by
++                    // the CPU and never take that path, so 0 works for them.
++                    allocationInfo->Alignment = PAGE_SIZE;
 +                    allocationInfo->SupportedReadSegmentSet = 1u << (VioGpuAdapter::ACCOUNT_SEGMENT_ID - 1);
 +                    allocationInfo->SupportedWriteSegmentSet = 1u << (VioGpuAdapter::ACCOUNT_SEGMENT_ID - 1);
 +                }
