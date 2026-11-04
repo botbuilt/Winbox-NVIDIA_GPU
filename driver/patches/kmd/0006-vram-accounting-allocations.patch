@@ -14,8 +14,74 @@ index b859e3b..2edb580 100644
  #pragma pack(1)
  typedef struct _VIOGPU_RESOURCE_BLOB_OPTIONS
  {
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+index cea2489..722eadb 100644
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -41,6 +41,7 @@
+ #pragma code_seg("INIT")
+ 
+ int nDebugLevel;
++ULONG g_VramSegmentMode;
+ int virtioDebugLevel;
+ int bDebugPrint;
+ int bBreakAlways;
+@@ -107,7 +108,8 @@ static VOID VioGpuReadDriverParameters(_In_ PUNICODE_STRING pRegistryPath)
+     RtlCopyMemory(path, pRegistryPath->Buffer, pRegistryPath->Length);
+     RtlCopyMemory((PUCHAR)path + pRegistryPath->Length, paramsSuffix, sizeof(paramsSuffix));
+ 
+-    RTL_QUERY_REGISTRY_TABLE query[2];
++    ULONG vramSegmentMode = 0;
++    RTL_QUERY_REGISTRY_TABLE query[3];
+     RtlZeroMemory(query, sizeof(query));
+     // DbgPrint verbosity (TRACE_LEVEL_*).  Absent or 0 keeps the
+     // compiled-in level, which is silent unless DBG_VERBOSE was defined --
+@@ -118,6 +120,13 @@ static VOID VioGpuReadDriverParameters(_In_ PUNICODE_STRING pRegistryPath)
+     query[0].DefaultType = (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD;
+     query[0].DefaultData = &defaultValue;
+     query[0].DefaultLength = sizeof(defaultValue);
++    // VRAM accounting segment layout (VioGpuVramSegmentMode); 0 = off.
++    query[1].Flags = RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK;
++    query[1].Name = (PWSTR)L"VramSegmentMode";
++    query[1].EntryContext = &vramSegmentMode;
++    query[1].DefaultType = (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD;
++    query[1].DefaultData = &defaultValue;
++    query[1].DefaultLength = sizeof(defaultValue);
+ 
+     NTSTATUS status = RtlQueryRegistryValues(RTL_REGISTRY_ABSOLUTE, path, query, NULL, NULL);
+     ExFreePoolWithTag(path, VIOGPU3D_REGPATH_TAG);
+@@ -131,6 +140,7 @@ static VOID VioGpuReadDriverParameters(_In_ PUNICODE_STRING pRegistryPath)
+     {
+         nDebugLevel = (int)debugLevel;
+     }
++    g_VramSegmentMode = (vramSegmentMode <= 3) ? vramSegmentMode : 0;
+ }
+ 
+ // The Triton driver only runs with these two Graphics Drivers values,
+diff --git a/viogpu/viogpu3d/driver.h b/viogpu/viogpu3d/driver.h
+index d56e93b..f4aa987 100644
+--- a/viogpu/viogpu3d/driver.h
++++ b/viogpu/viogpu3d/driver.h
+@@ -32,6 +32,17 @@
+ 
+ extern "C" DRIVER_INITIALIZE DriverEntry;
+ 
++// Services\VioGpu3D\Parameters\VramSegmentMode (read at load; restart to
++// change).  The VRAM accounting segment (segment 3) is still a test, so it is
++// off by default:
++//   0  off: two segments, accounting allocations fail and go uncounted
++//   1  segment 3 added, nothing else changed
++//   2  1 + shmem segment PopulatedFromSystemMemory (so only segment 3 is
++//      dedicated video memory and the local budget)
++//   3  2 + an explicit budget group on every segment (aperture and shmem
++//      non-local, segment 3 local)
++extern ULONG g_VramSegmentMode;
++
+ VOID VioGpu3DUnload(VOID);
+ 
+ NTSTATUS
 diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
-index 7105cc9..57847c9 100644
+index 7105cc9..ef5036b 100644
 --- a/viogpu/viogpu3d/viogpu_adapter.cpp
 +++ b/viogpu/viogpu3d/viogpu_adapter.cpp
 @@ -933,7 +933,7 @@ NTSTATUS VioGpuAdapter::QueryDeviceDescriptor(_In_ ULONG ChildUid, _Inout_ DXGK_
@@ -27,15 +93,35 @@ index 7105cc9..57847c9 100644
  
  // Windows 10 (build 19045 checked) VidMm's InitPagingProcessVaSpace maps the
  // first paging buffers into the paging process through their segment
-@@ -991,6 +991,33 @@ template <typename DESC> void VioGpuAdapter::FillShmemSegment(DESC *pDesc)
+@@ -978,6 +978,13 @@ template <typename DESC> static void FillApertureSegment(DESC *pDesc)
+     pDesc->Flags.CacheCoherent = TRUE;
+     pDesc->Flags.CpuVisible = FALSE;
+     pDesc->Flags.DirectFlip = TRUE;
++    // Mode 3 names a budget group on every segment (58115 named one on
++    // segments 2 and 3 only, and Windows 10 refused the layout: Code 43
++    // right after the segment query).
++    if (g_VramSegmentMode >= 3)
++    {
++        pDesc->Flags.NonLocalBudgetGroup = TRUE;
++    }
+ }
+ 
+ template <typename DESC> void VioGpuAdapter::FillShmemSegment(DESC *pDesc)
+@@ -991,6 +998,42 @@ template <typename DESC> void VioGpuAdapter::FillShmemSegment(DESC *pDesc)
      pDesc->Flags.CacheCoherent = TRUE;
      pDesc->Flags.CpuVisible = TRUE;
      pDesc->Flags.DirectFlip = TRUE;
 +    // The shmem window is host RAM, not the GPU's memory: report it as
 +    // memory populated from system memory and keep it out of the local
 +    // (video memory) budget.  Segment 3 stands for the GPU's memory.
-+    pDesc->Flags.PopulatedFromSystemMemory = TRUE;
-+    pDesc->Flags.NonLocalBudgetGroup = TRUE;
++    if (g_VramSegmentMode >= 2)
++    {
++        pDesc->Flags.PopulatedFromSystemMemory = TRUE;
++    }
++    if (g_VramSegmentMode >= 3)
++    {
++        pDesc->Flags.NonLocalBudgetGroup = TRUE;
++    }
 +}
 +
 +// Segment 3 stands for the host GPU memory the guest's host-only textures
@@ -57,16 +143,19 @@ index 7105cc9..57847c9 100644
 +    pDesc->Flags.Aperture = FALSE;
 +    pDesc->Flags.CacheCoherent = TRUE;
 +    pDesc->Flags.CpuVisible = FALSE;
-+    pDesc->Flags.LocalBudgetGroup = TRUE;
++    if (g_VramSegmentMode >= 3)
++    {
++        pDesc->Flags.LocalBudgetGroup = TRUE;
++    }
  }
  
  NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQueryAdapterInfo)
-@@ -1149,16 +1176,17 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+@@ -1149,16 +1192,17 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                  }
  
                  DXGK_QUERYSEGMENTOUT3 *pSegmentInfo = (DXGK_QUERYSEGMENTOUT3 *)pQueryAdapterInfo->pOutputData;
 -                const UINT nbSegments = m_VioDev.shmem.available ? 2 : 1;
-+                const UINT nbSegments = m_VioDev.shmem.available ? 3 : 1;
++                const UINT nbSegments = !m_VioDev.shmem.available ? 1 : (g_VramSegmentMode ? 3 : 2);
                  pSegmentInfo->NbSegment = nbSegments;
                  if (pSegmentInfo->pSegmentDescriptor)
                  {
@@ -81,16 +170,16 @@ index 7105cc9..57847c9 100644
                      }
                  }
                  DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s Requested segments\n", __FUNCTION__));
-@@ -1182,7 +1210,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+@@ -1182,7 +1226,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                  }
  
                  DXGK_QUERYSEGMENTOUT4 *pSegmentInfo = (DXGK_QUERYSEGMENTOUT4 *)pQueryAdapterInfo->pOutputData;
 -                const UINT nbSegments = m_VioDev.shmem.available ? 2 : 1;
-+                const UINT nbSegments = m_VioDev.shmem.available ? 3 : 1;
++                const UINT nbSegments = !m_VioDev.shmem.available ? 1 : (g_VramSegmentMode ? 3 : 2);
  
                  // Two-call contract: the first call has NbSegment == 0 (and no
                  // descriptor array); report only the segment count and touch
-@@ -1212,9 +1240,10 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+@@ -1212,9 +1256,10 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                  }
                  RtlZeroMemory(pSegmentInfo->pSegmentDescriptor, stride * nbSegments);
                  FillApertureSegment((DXGK_SEGMENTDESCRIPTOR4 *)pSegmentInfo->pSegmentDescriptor);
@@ -103,10 +192,20 @@ index 7105cc9..57847c9 100644
  
                  DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s Requested segments (v4)\n", __FUNCTION__));
 diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
-index 3bc163f..25a641f 100644
+index 3bc163f..1611755 100644
 --- a/viogpu/viogpu3d/viogpu_adapter.h
 +++ b/viogpu/viogpu3d/viogpu_adapter.h
-@@ -109,6 +109,10 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
+@@ -79,6 +79,9 @@ struct CAPSET_INFO
+ 
+ virtio_gpu_formats ColorFormat(UINT format);
+ 
++// See driver.h.
++extern ULONG g_VramSegmentMode;
++
+ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVioGpuPCI
+ {
+   public:
+@@ -109,6 +112,10 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
      }
  
      static const ULONGLONG SHMEM_GPU_BASE_VA = 0x700000000;
@@ -117,7 +216,7 @@ index 3bc163f..25a641f 100644
    private:
      DEVICE_OBJECT *m_pPhysicalDevice;
      DXGKRNL_INTERFACE m_DxgkInterface;
-@@ -217,6 +221,7 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
+@@ -217,6 +224,7 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
      VOID DpcRoutine(VOID);
      NTSTATUS QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQueryAdapterInfo);
      template <typename DESC> void FillShmemSegment(DESC *pDesc);
@@ -126,10 +225,27 @@ index 3bc163f..25a641f 100644
      NTSTATUS QueryInterface(_In_ CONST PQUERY_INTERFACE QueryInterface);
      NTSTATUS StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
 diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
-index b67507d..6791ff0 100644
+index b67507d..050265a 100644
 --- a/viogpu/viogpu3d/viogpu_allocation.cpp
 +++ b/viogpu/viogpu3d/viogpu_allocation.cpp
-@@ -1206,6 +1206,23 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+@@ -1037,6 +1037,16 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+         resourceExchange = (VIOGPU_CREATE_ALLOCATION_EXCHANGE *)pCreateAllocation->pPrivateDriverData;
+     }
+ 
++    // VRAM accounting allocations need the accounting segment, which is
++    // only reported when VramSegmentMode is set.  Refuse them before
++    // anything is created; the UMD then leaves the resource uncounted.
++    if (resourceExchange->Type == VIOGPU_RESOURCE_TYPE_BLOB &&
++        (resourceExchange->OptionsBlob.blob_flags & VIOGPU_BLOB_FLAG_VRAM_ACCOUNT) &&
++        (g_VramSegmentMode == 0 || adapter->GetShmemPA() == 0))
++    {
++        return STATUS_NOT_SUPPORTED;
++    }
++
+     VioGpuAllocation *allocation = NULL;
+ 
+     switch (resourceExchange->Type) {
+@@ -1206,6 +1216,23 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
                  // allocationInfo->Flags.Swizzled = TRUE;
                  allocationInfo->SupportedReadSegmentSet = 0b10;
                  allocationInfo->SupportedWriteSegmentSet = 0b10;

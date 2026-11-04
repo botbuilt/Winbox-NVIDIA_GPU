@@ -50,10 +50,15 @@ inputs and these changes:
   memory window (`VRAM_SIZE`), has no memory behind it and the CPU cannot
   see it. (A first version put them in the GPU memory window itself;
   Windows then cleared each one through the CPU, one trapped access at a
-  time, and froze at login.) The GPU memory window is now reported as
-  system memory outside the video memory budget, so "Dedicated GPU memory"
-  in Task Manager is the new segment. `NPT_VRAM_ACCOUNT=0` (a Windows
-  environment variable) turns the placeholders off.
+  time, and froze at login.) The segment is still a test and is off by
+  default. The registry value
+  `HKLM\SYSTEM\CurrentControlSet\Services\VioGpu3D\Parameters\VramSegmentMode`
+  (DWORD, read at boot) turns it on: `1` adds the segment, `2` also reports
+  the GPU memory window as system memory so only the new segment counts as
+  dedicated GPU memory, `3` also names a budget group on every segment.
+  A mode Windows refuses shows Code 43; set the value back to `0` and
+  restart. `NPT_VRAM_ACCOUNT=0` (a Windows environment variable) turns the
+  placeholders off in apps.
 - [`patches/kmd/0001`](patches/kmd/0001-win10-paging-buffer-segment.patch),
   **Windows 10.** The driver puts its paging buffers in system memory.
   Windows 11 accepts that, but Windows 10's video memory manager
