@@ -1,0 +1,57 @@
+diff --git a/src/virtio/neptune/npt_renderer_virtgpu_win32.c b/src/virtio/neptune/npt_renderer_virtgpu_win32.c
+index 31716a6..064829e 100644
+--- a/src/virtio/neptune/npt_renderer_virtgpu_win32.c
++++ b/src/virtio/neptune/npt_renderer_virtgpu_win32.c
+@@ -590,8 +590,13 @@ static NTSTATUS
+ virtgpu_resource_destroy_blob(struct npt_virtgpu *gpu,
+                               D3DKMT_HANDLE alloc, D3DKMT_HANDLE res_kmt)
+ {
++   /* A failed drain must not skip the destroy.  Returning here leaked the
++    * allocation for the life of the process, and with it the host texture
++    * it keeps attached: DWM opens every window's surface this way, so its
++    * shared GPU memory grew until the host ran out of video memory. */
+    if (!virtgpu_drain(gpu))
+-      return STATUS_UNSUCCESSFUL;
++      npt_log("virtgpu: drain before destroy failed, destroying alloc=0x%x anyway",
++              alloc);
+ 
+    D3DKMT_DESTROYALLOCATION destroy = {
+       .hDevice = gpu->device,
+@@ -611,6 +616,10 @@ virtgpu_resource_destroy_blob(struct npt_virtgpu *gpu,
+    return STATUS_SUCCESS;
+ }
+ 
++/* Imported textures this process holds open; logged so a leak shows up
++ * as a count that only climbs. */
++static volatile LONG npt_vgw32_imports_live;
++
+ /* Attach an existing VM-global virtio resource to this transport
+  * context via a VIOGPU_RESOURCE_TYPE_IMPORT allocation, so the host
+  * worker receives the resource fd (proxy attach-forwarding) before a
+@@ -664,8 +673,9 @@ npt_vgw32_import_res(struct npt_renderer *r, uint32_t res_id, uint64_t size,
+    if (!virtgpu_drain(gpu))
+       npt_log("virtgpu: import_res res_id=%u post-drain failed", res_id);
+ 
+-   npt_log("virtgpu: import_res res_id=%u alloc=0x%x", res_id,
+-           alloc_info.hAllocation);
++   const LONG live = InterlockedIncrement(&npt_vgw32_imports_live);
++   npt_log("virtgpu: import_res res_id=%u alloc=0x%x (%ld open)", res_id,
++           alloc_info.hAllocation, live);
+    return true;
+ }
+ 
+@@ -676,8 +686,12 @@ npt_vgw32_release_import_res(struct npt_renderer *r, uint32_t alloc,
+    struct npt_virtgpu *gpu = (struct npt_virtgpu *)r;
+    if (!alloc && !res_kmt)
+       return;
+-   virtgpu_resource_destroy_blob(gpu, (D3DKMT_HANDLE)alloc,
+-                                 (D3DKMT_HANDLE)res_kmt);
++   NTSTATUS status = virtgpu_resource_destroy_blob(gpu, (D3DKMT_HANDLE)alloc,
++                                                   (D3DKMT_HANDLE)res_kmt);
++   const LONG live = InterlockedDecrement(&npt_vgw32_imports_live);
++   if (!NT_SUCCESS(status))
++      npt_log("virtgpu: release_import alloc=0x%x failed 0x%lx (%ld open)",
++              alloc, status, live);
+ }
+ 
+ static bool

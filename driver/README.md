@@ -9,7 +9,7 @@
 | Direct3D user-mode driver (`neptune_umd.dll`, 64-bit and 32-bit) and Venus Vulkan driver | [osy/virtio-win-mesa](https://github.com/osy/virtio-win-mesa) (Mesa fork) |
 
 The driver is the upstream authors' work. This folder only holds the build
-inputs and three fixes:
+inputs and these changes:
 
 - [`patches/mesa/0001`](patches/mesa/0001-wow64-pointer-sized-wire-types.patch),
   **32-bit (WOW64) programs.** Handle- and pointer-sized values (`SIZE_T`,
@@ -23,12 +23,72 @@ inputs and three fixes:
   adapter, so D3D on the virtio GPU was unavailable ("D3D Status: Not
   Available" in dxdiag). It now also finds the GPU by its PCI ID
   (`1AF4:1050`).
+- [`patches/mesa/0003`](patches/mesa/0003-longer-ring-idle-timeout.patch),
+  **Fewer wake-ups per frame (test).** The host stopped watching an app's
+  command ring 1 ms after its last command, so nearly every frame had to
+  wake it again through the kernel driver. It now keeps watching for 8 ms.
+  The `NPT_RING_IDLE_MS` environment variable (1 to 100) overrides that.
+- [`patches/mesa/0004`](patches/mesa/0004-release-imported-textures.patch),
+  **Leaked window textures (test).** When the desktop compositor (DWM)
+  stopped using another program's window surface, the driver skipped
+  freeing it if a sync step failed first. The surface and its texture on
+  the host GPU then stayed allocated, so DWM's shared GPU memory and the
+  host's video memory grew until the host ran out of RAM. The driver now
+  frees it anyway and logs how many such surfaces each process holds open.
+- [`patches/mesa/0005`](patches/mesa/0005-vram-accounting.patch) and
+  [`patches/kmd/0006`](patches/kmd/0006-vram-accounting-allocations.patch),
+  **Games see how much GPU memory they use (test).** Textures and buffers
+  live only on the host GPU, so Windows counted almost none of them and
+  told every game it had used nothing out of its budget. Games that size
+  their texture streaming by that budget kept loading textures as you
+  played until the host GPU was full and spilled into host RAM, and Unraid
+  killed WinBox. Each large texture or buffer (128 KB or more) now also
+  gets an empty placeholder allocation of the same size, so Windows' video
+  memory usage and budget match what the game really has on the GPU, and
+  the game trims itself. The placeholders live in a new third memory
+  segment that stands for the GPU's memory: it is as large as the GPU
+  memory window (`VRAM_SIZE`), has no memory behind it and the CPU cannot
+  see it. Windows clears every new allocation in such a segment through a
+  GPU address range it reserves with the allocation's alignment; an
+  alignment of 0 is refused there and Windows 10 retried forever, which
+  froze the login, so the placeholders now ask for 4 KB alignment. (A first
+  version put them in the GPU memory window itself and also froze at
+  login.) The segment is still a test and is off by default. The registry value
+  `HKLM\SYSTEM\CurrentControlSet\Services\VioGpu3D\Parameters\VramSegmentMode`
+  (DWORD, read at boot) turns it on: `1` adds the segment, `2` also reports
+  the GPU memory window as system memory so only the new segment counts as
+  dedicated GPU memory, `3` also names a budget group on every segment.
+  A mode Windows refuses shows Code 43; set the value back to `0` and
+  restart. `NPT_VRAM_ACCOUNT=0` (a Windows environment variable) turns the
+  placeholders off in apps.
 - [`patches/kmd/0001`](patches/kmd/0001-win10-paging-buffer-segment.patch),
   **Windows 10.** The driver puts its paging buffers in system memory.
   Windows 11 accepts that, but Windows 10's video memory manager
   (`dxgmms2.sys`) then reads a missing allocation while setting up the GPU
   and blue-screens (stop code 0x7E) as soon as the driver starts. On
   Windows 10 the paging buffers now go in a GPU memory segment instead.
+- [`patches/kmd/0002`](patches/kmd/0002-win10-idle-copy-node.patch),
+  **Windows 10 freeze.** With a single GPU engine, Windows 10's scheduler
+  can spin forever while holding its lock, which froze Windows as soon as a
+  browser used the GPU. On Windows 10 the driver now reports a second, idle
+  copy engine that completes its work at once, so the scheduler takes its
+  normal path.
+- [`patches/kmd/0003`](patches/kmd/0003-overlap-host-round-trips.patch),
+  **More work in flight (test).** The driver ran one GPU packet at a time
+  and kept that slot while it waited for the host to answer, so every
+  packet from every app waited for the one before it. A packet whose last
+  command is already on its way to the host (or only waits for the GPU to
+  finish) now gives its slot back, and the next packet starts. Packets
+  still reach the host in order and still report as finished in order.
+- [`patches/kmd/0004`](patches/kmd/0004-msi-interrupts.patch),
+  **MSI interrupts (test).** The GPU's three message interrupts (display
+  change, commands, cursor) are now used instead of one shared interrupt.
+- [`patches/kmd/0005`](patches/kmd/0005-keep-scheduler-registry-values.patch),
+  **Keep the two required registry values.** The driver needs
+  `GraphicsDrivers\TdrDebugMode=1` and `GraphicsDrivers\Scheduler\EnablePreemption=0`.
+  The INF writes them only at install, and Windows sometimes loses them
+  (the GPU then shows Code 43). The driver now writes them again every
+  time it loads, so after one restart the GPU works again on its own.
 
 ## Build details
 
