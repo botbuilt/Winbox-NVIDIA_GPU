@@ -1,0 +1,52 @@
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+index 5de18b3..cea2489 100644
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -133,6 +133,39 @@ static VOID VioGpuReadDriverParameters(_In_ PUNICODE_STRING pRegistryPath)
+     }
+ }
+ 
++// The Triton driver only runs with these two Graphics Drivers values,
++// which the INF writes once at install time.  Windows does not always keep
++// them (they have gone missing on Windows 10 without a driver change), and
++// without them the GPU stops with Code 43.  Write them again on every
++// boot so they survive; the GPU scheduler reads them at boot, so a lost
++// value is back in effect after the next restart.
++static VOID VioGpuEnsureSchedulerSettings(VOID)
++{
++    PAGED_CODE();
++
++    ULONG tdrDebugMode = 1;
++    ULONG enablePreemption = 0;
++    NTSTATUS status;
++
++    status = RtlWriteRegistryValue(RTL_REGISTRY_CONTROL, L"GraphicsDrivers", L"TdrDebugMode",
++                                   REG_DWORD, &tdrDebugMode, sizeof(tdrDebugMode));
++    if (!NT_SUCCESS(status))
++    {
++        DbgPrint(TRACE_LEVEL_WARNING, ("%s TdrDebugMode write failed 0x%X\n", __FUNCTION__, status));
++    }
++
++    status = RtlCreateRegistryKey(RTL_REGISTRY_CONTROL, (PWSTR)L"GraphicsDrivers\\Scheduler");
++    if (NT_SUCCESS(status))
++    {
++        status = RtlWriteRegistryValue(RTL_REGISTRY_CONTROL, L"GraphicsDrivers\\Scheduler", L"EnablePreemption",
++                                       REG_DWORD, &enablePreemption, sizeof(enablePreemption));
++    }
++    if (!NT_SUCCESS(status))
++    {
++        DbgPrint(TRACE_LEVEL_WARNING, ("%s EnablePreemption write failed 0x%X\n", __FUNCTION__, status));
++    }
++}
++
+ extern "C" NTSTATUS DriverEntry(_In_ DRIVER_OBJECT *pDriverObject, _In_ UNICODE_STRING *pRegistryPath)
+ {
+     PAGED_CODE();
+@@ -238,6 +271,7 @@ extern "C" NTSTATUS DriverEntry(_In_ DRIVER_OBJECT *pDriverObject, _In_ UNICODE_
+     InitialData.DxgkDdiSetStablePowerState = VioGpu3DDdiSetStablePowerState;
+ 
+     VioGpuReadDriverParameters(pRegistryPath);
++    VioGpuEnsureSchedulerSettings();
+ 
+     NTSTATUS Status = DxgkInitialize(pDriverObject, pRegistryPath, &InitialData);
+ 

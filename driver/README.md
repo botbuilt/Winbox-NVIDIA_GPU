@@ -57,6 +57,12 @@ inputs and these changes:
 - [`patches/kmd/0004`](patches/kmd/0004-msi-interrupts.patch),
   **MSI interrupts (test).** The GPU's three message interrupts (display
   change, commands, cursor) are now used instead of one shared interrupt.
+- [`patches/kmd/0005`](patches/kmd/0005-keep-scheduler-registry-values.patch),
+  **Keep the two required registry values.** The driver needs
+  `GraphicsDrivers\TdrDebugMode=1` and `GraphicsDrivers\Scheduler\EnablePreemption=0`.
+  The INF writes them only at install, and Windows sometimes loses them
+  (the GPU then shows Code 43). The driver now writes them again every
+  time it loads, so after one restart the GPU works again on its own.
 
 ## Build details
 
