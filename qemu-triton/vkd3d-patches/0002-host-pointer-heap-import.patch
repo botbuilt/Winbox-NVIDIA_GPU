@@ -1,0 +1,102 @@
+diff --git a/include/vkd3d_native_shared.h b/include/vkd3d_native_shared.h
+index 872b4cb..ed69b88 100644
+--- a/include/vkd3d_native_shared.h
++++ b/include/vkd3d_native_shared.h
+@@ -83,6 +83,9 @@ HRESULT vkd3d_open_existing_heap_from_dmabuf(ID3D12Device *device,
+         int dmabuf_fd, UINT64 size, REFIID iid, void **heap);
+ typedef HRESULT (*PFN_vkd3d_open_existing_heap_from_dmabuf)(ID3D12Device *device,
+         int dmabuf_fd, UINT64 size, REFIID iid, void **heap);
++/* Same heap, imported from host pages via VK_EXT_external_memory_host. */
++HRESULT vkd3d_open_existing_heap_from_host_pointer(ID3D12Device *device,
++        void *address, UINT64 size, REFIID iid, void **heap);
+ #endif
+ 
+ #ifdef __cplusplus
+diff --git a/libs/d3d12/main.c b/libs/d3d12/main.c
+index 8069196..db47722 100644
+--- a/libs/d3d12/main.c
++++ b/libs/d3d12/main.c
+@@ -190,6 +190,33 @@ HRESULT DLLEXPORT vkd3d_open_existing_heap_from_dmabuf(ID3D12Device *device,
+ 
+     return pfn(device, dmabuf_fd, size, iid, heap);
+ }
++
++typedef HRESULT (*PFN_vkd3d_open_existing_heap_from_host_pointer_fwd)(ID3D12Device *device,
++        void *address, UINT64 size, REFIID iid, void **heap);
++
++/* Forwarding stub for the host-pointer heap export (no-udmabuf hosts). */
++HRESULT DLLEXPORT vkd3d_open_existing_heap_from_host_pointer(ID3D12Device *device,
++        void *address, UINT64 size, REFIID iid, void **heap)
++{
++    static PFN_vkd3d_open_existing_heap_from_host_pointer_fwd pfn;
++
++    TRACE("device %p, address %p, size %"PRIu64", iid %s, heap %p.\n",
++            device, address, size, debugstr_guid(iid), heap);
++
++    if (!load_d3d12core())
++        return E_NOINTERFACE;
++
++    if (!pfn)
++        pfn = (PFN_vkd3d_open_existing_heap_from_host_pointer_fwd)vkd3d_dlsym(
++                d3d12core_module, "vkd3d_open_existing_heap_from_host_pointer");
++    if (!pfn)
++    {
++        ERR("d3d12core module lacks vkd3d_open_existing_heap_from_host_pointer.\n");
++        return E_NOTIMPL;
++    }
++
++    return pfn(device, address, size, iid, heap);
++}
+ #endif /* !_WIN32 */
+ 
+ HRESULT WINAPI DLLEXPORT D3D12CreateRootSignatureDeserializer(const void *data, SIZE_T data_size,
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index ffa157b..4010478 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -8506,6 +8506,45 @@ HRESULT vkd3d_open_existing_heap_from_dmabuf(ID3D12Device *device_iface,
+ 
+     return return_interface(&object->ID3D12Heap_iface, &IID_ID3D12Heap, iid, heap);
+ }
++/* Native-only export: host-pointer twin of
++ * vkd3d_open_existing_heap_from_dmabuf, for hosts without /dev/udmabuf.
++ * The heap's VkDeviceMemory is a VK_EXT_external_memory_host import of
++ * [address, address + size); address and size must honour
++ * minImportedHostPointerAlignment.  The pages stay owned by the caller
++ * and must outlive the heap.  Same heap shape as the dmabuf export (no
++ * SHARED_CROSS_ADAPTER, so placed buffers need no extra flags). */
++__attribute__((visibility("default")))
++HRESULT vkd3d_open_existing_heap_from_host_pointer(ID3D12Device *device_iface,
++        void *address, UINT64 size, REFIID iid, void **heap)
++{
++    struct d3d12_device *device = unsafe_impl_from_ID3D12Device((d3d12_device_iface *)device_iface);
++    D3D12_HEAP_DESC heap_desc;
++    struct d3d12_heap *object;
++    HRESULT hr;
++
++    TRACE("device %p, address %p, size %"PRIu64", iid %s, heap %p\n",
++            device_iface, address, size, debugstr_guid(iid), heap);
++
++    if (heap)
++        *heap = NULL;
++    if (!device || !address || !size)
++        return E_INVALIDARG;
++
++    memset(&heap_desc, 0, sizeof(heap_desc));
++    heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
++    heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
++    heap_desc.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
++    heap_desc.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
++    heap_desc.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;
++    heap_desc.Properties.CreationNodeMask = 1;
++    heap_desc.Properties.VisibleNodeMask = 1;
++    heap_desc.SizeInBytes = size;
++
++    if (FAILED(hr = d3d12_heap_create(device, &heap_desc, address, 0, &object)))
++        return hr;
++
++    return return_interface(&object->ID3D12Heap_iface, &IID_ID3D12Heap, iid, heap);
++}
+ #endif /* !_WIN32 */
+ 
+ static HRESULT STDMETHODCALLTYPE d3d12_device_OpenExistingHeapFromAddress(d3d12_device_iface *iface,
