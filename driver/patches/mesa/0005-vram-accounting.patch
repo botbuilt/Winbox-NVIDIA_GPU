@@ -15,7 +15,7 @@ index a7d5e6c..bb483d3 100644
  
      /* Single-sample, single-mip, single-slice shared texture a back buffer of
 diff --git a/src/virtio/neptune/triton/tritonKm.c b/src/virtio/neptune/triton/tritonKm.c
-index 4a359d5..78150ca 100644
+index 4a359d5..fb5ca60 100644
 --- a/src/virtio/neptune/triton/tritonKm.c
 +++ b/src/virtio/neptune/triton/tritonKm.c
 @@ -120,14 +120,14 @@ tritonKmLoadFence(volatile const UINT64 *va)
@@ -55,7 +55,7 @@ index 4a359d5..78150ca 100644
        return;
  
     D3DDDI_MAKERESIDENT mr;
-@@ -241,3 +249,201 @@ tritonKmFillSharedExchange(VIOGPU_CREATE_ALLOCATION_EXCHANGE *ax,
+@@ -241,3 +249,215 @@ tritonKmFillSharedExchange(VIOGPU_CREATE_ALLOCATION_EXCHANGE *ax,
        ax->Size = ((d->Width * d->Height * 4) + 4095) & ~4095ull;
     return TRUE;
  }
@@ -159,6 +159,7 @@ index 4a359d5..78150ca 100644
 +static volatile LONG64 g_AccLiveCount; /* allocations currently counted */
 +static volatile LONG   g_AccOk, g_AccAllocFail, g_AccResFail, g_AccPending;
 +static volatile LONG   g_AccNoQueue, g_AccStep;
++static volatile LONG   g_ResCreated, g_ResDestroyed;
 +
 +#define TRITON_KM_ACCOUNT_LOG_STEP (256ull << 20)
 +
@@ -171,10 +172,23 @@ index 4a359d5..78150ca 100644
 +   if (why == NULL && prev == step)
 +      return;
 +   TR_LOG("vram-account pid %lu: %s live %lld MB in %lld allocs; ok %ld, "
-+          "pending %ld, alloc failed %ld, resident failed %ld, no queue %ld",
++          "pending %ld, alloc failed %ld, resident failed %ld, no queue %ld; "
++          "resources created %ld destroyed %ld",
 +          (unsigned long)GetCurrentProcessId(), why ? why : "step",
 +          (long long)(live >> 20), (long long)g_AccLiveCount, g_AccOk,
-+          g_AccPending, g_AccAllocFail, g_AccResFail, g_AccNoQueue);
++          g_AccPending, g_AccAllocFail, g_AccResFail, g_AccNoQueue,
++          g_ResCreated, g_ResDestroyed);
++}
++
++void
++tritonKmNoteResource(BOOL created)
++{
++   const LONG n = created ? InterlockedIncrement(&g_ResCreated)
++                          : InterlockedIncrement(&g_ResDestroyed);
++   /* Every 1000 creates or destroys, so destroys of uncounted (small or
++    * CPU-side) resources show up even when no counted one is freed. */
++   if (n % 1000 == 0)
++      tritonKmAccountReport(created ? "res+1000;" : "res-1000;");
 +}
 +
 +void
@@ -258,10 +272,10 @@ index 4a359d5..78150ca 100644
 +   return ai.hAllocation;
 +}
 diff --git a/src/virtio/neptune/triton/tritonKm.h b/src/virtio/neptune/triton/tritonKm.h
-index 879f031..199a6a7 100644
+index 879f031..32852f9 100644
 --- a/src/virtio/neptune/triton/tritonKm.h
 +++ b/src/virtio/neptune/triton/tritonKm.h
-@@ -55,6 +55,24 @@ HRESULT tritonKmEscape(const TRITON_KM *km, VIOGPU_ESCAPE *esc);
+@@ -55,6 +55,26 @@ HRESULT tritonKmEscape(const TRITON_KM *km, VIOGPU_ESCAPE *esc);
  void    tritonKmEnsureRuntimeCtx(TRITON_KM *km);
  void    tritonKmRequestResidency(TRITON_KM *km, D3DKMT_HANDLE hAllocation);
  
@@ -282,6 +296,8 @@ index 879f031..199a6a7 100644
 +D3DKMT_HANDLE tritonKmCreateAccountAlloc(TRITON_KM *km, UINT64 bytes);
 +/* Counts a freed accounting allocation of `bytes` (as passed to create). */
 +void tritonKmAccountNoteFree(UINT64 bytes);
++/* Counts every created (TRUE) and destroyed (FALSE) D3D11 resource. */
++void tritonKmNoteResource(BOOL created);
 +
  /* The D3D11 description of a texture being exported as a shared blob. */
  typedef struct TRITON_KM_SHARED_DESC {
@@ -312,7 +328,7 @@ index 8cdbe13..5195a5c 100644
  D3DKMT_HANDLE
  triton12AllocResidencyOnly(PTRITON12_DEVICE p, HANDLE hRTResource)
 diff --git a/src/virtio/neptune/triton/tritonResource.c b/src/virtio/neptune/triton/tritonResource.c
-index e47217f..890fdb8 100644
+index e47217f..add9190 100644
 --- a/src/virtio/neptune/triton/tritonResource.c
 +++ b/src/virtio/neptune/triton/tritonResource.c
 @@ -217,6 +217,8 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
@@ -324,10 +340,12 @@ index e47217f..890fdb8 100644
  
      /* Non-primary TEXTURE2D with MISC_SHARED: emulate the shared handle.
       * Display primaries take the host-swapchain route below.
-@@ -451,6 +453,19 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
+@@ -451,6 +453,21 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
          return;
      }
  
++    tritonKmNoteResource(TRUE);
++
 +    /* Host-only GPU memory is invisible to Windows: without a KM
 +     * allocation the video memory manager reports ~0 usage, so a game's
 +     * budget (QueryVideoMemoryInfo) never fills and its texture streaming
@@ -344,7 +362,14 @@ index e47217f..890fdb8 100644
      if (isShared) {
          if (!tritonRegisterSharedBlob(pD, r, r->pResource, (UINT)usage, bind,
                                        cpuAccess, misc, r->Format, FALSE))
-@@ -525,6 +540,17 @@ tritonDestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource)
+@@ -519,12 +536,24 @@ tritonDestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource)
+     if (r->pResource) {
+         ID3D11Resource_Release(r->pResource);
+         r->pResource = NULL;
++        tritonKmNoteResource(FALSE);
+     }
+     if (r->pPresentCompanion) {
+         ID3D11Resource_Release(r->pPresentCompanion);
          r->pPresentCompanion = NULL;
      }
  
