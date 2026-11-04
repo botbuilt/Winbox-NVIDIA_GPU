@@ -1,0 +1,150 @@
+diff --git a/src/virtio/neptune/npt_event.c b/src/virtio/neptune/npt_event.c
+index 5b766eb..5e1f6f5 100644
+--- a/src/virtio/neptune/npt_event.c
++++ b/src/virtio/neptune/npt_event.c
+@@ -17,6 +17,7 @@
+ 
+ #if defined(_WIN32)
+ #include <windows.h>
++#include "npt_win32_thread.h"
+ #else
+ #include <errno.h>
+ #include <poll.h>
+@@ -106,7 +107,7 @@ struct npt_event_state {
+    uint32_t                       waiter_count;
+    uint32_t                       waiter_idle;
+ #if defined(_WIN32)
+-   HANDLE                         waiter_thread[NPT_EVENT_WAITER_MAX];
++   struct npt_thread              waiter_thread[NPT_EVENT_WAITER_MAX];
+ #else
+    pthread_t                      waiter_thread[NPT_EVENT_WAITER_MAX];
+ #endif
+@@ -380,10 +381,10 @@ event_waiter_spawn(struct npt_device *dev, struct npt_event_state *st)
+    if (st->waiter_count >= NPT_EVENT_WAITER_MAX)
+       return;
+ #if defined(_WIN32)
+-   HANDLE t = CreateThread(NULL, 0, event_waiter_thread, dev, 0, NULL);
+-   if (!t)
++   if (!npt_thread_create(&st->waiter_thread[st->waiter_count],
++                          event_waiter_thread, dev))
+       return;
+-   st->waiter_thread[st->waiter_count++] = t;
++   st->waiter_count++;
+ #else
+    if (pthread_create(&st->waiter_thread[st->waiter_count], NULL,
+                       event_waiter_thread, dev) != 0)
+@@ -436,8 +437,9 @@ npt_event_fini(struct npt_device *dev)
+ 
+    for (uint32_t i = 0; i < waiters; i++) {
+ #if defined(_WIN32)
+-      WaitForSingleObject(st->waiter_thread[i], INFINITE);
+-      CloseHandle(st->waiter_thread[i]);
++      /* Not the thread handle: teardown may hold the loader lock
++       * (see npt_win32_thread.h). */
++      npt_thread_join(&st->waiter_thread[i]);
+ #else
+       pthread_join(st->waiter_thread[i], NULL);
+ #endif
+diff --git a/src/virtio/neptune/npt_win32_thread.h b/src/virtio/neptune/npt_win32_thread.h
+new file mode 100644
+index 0000000..fe1b7b2
+--- /dev/null
++++ b/src/virtio/neptune/npt_win32_thread.h
+@@ -0,0 +1,97 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Worker threads that device teardown joins.
++ *
++ * Teardown can run under the loader lock: an app that unloads an OpenGL
++ * ICD (Mesa's GL on D3D12) releases the D3D12 device from inside
++ * FreeLibrary.  A thread's exit takes the loader lock for
++ * DLL_THREAD_DETACH, so waiting on the thread handle there never returns.
++ * Join on an event the thread sets after its last access to shared state
++ * instead.  The thread holds a reference on this module and leaves through
++ * FreeLibraryAndExitThread, so the DLL stays mapped until the thread is
++ * out of its code.
++ */
++
++#ifndef NPT_WIN32_THREAD_H
++#define NPT_WIN32_THREAD_H
++
++#if defined(_WIN32)
++
++#include <windows.h>
++#include <stdlib.h>
++
++struct npt_thread {
++   HANDLE thread;
++   HANDLE done;
++};
++
++struct npt_thread_start {
++   LPTHREAD_START_ROUTINE fn;
++   void *arg;
++   HANDLE done;
++   HMODULE module;
++};
++
++static DWORD WINAPI
++npt_thread_trampoline(LPVOID p)
++{
++   struct npt_thread_start s = *(struct npt_thread_start *)p;
++   free(p);
++   DWORD rc = s.fn(s.arg);
++   SetEvent(s.done);
++   if (s.module)
++      FreeLibraryAndExitThread(s.module, rc);
++   return rc;
++}
++
++static inline BOOL
++npt_thread_create(struct npt_thread *t, LPTHREAD_START_ROUTINE fn, void *arg)
++{
++   t->thread = NULL;
++   t->done = NULL;
++
++   struct npt_thread_start *s = malloc(sizeof(*s));
++   if (!s)
++      return FALSE;
++   s->fn = fn;
++   s->arg = arg;
++   s->module = NULL;
++   s->done = CreateEventW(NULL, TRUE, FALSE, NULL);
++   if (!s->done) {
++      free(s);
++      return FALSE;
++   }
++   GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
++                      (LPCWSTR)(void *)npt_thread_trampoline, &s->module);
++
++   HANDLE done = s->done;
++   HANDLE h = CreateThread(NULL, 0, npt_thread_trampoline, s, 0, NULL);
++   if (!h) {
++      if (s->module)
++         FreeLibrary(s->module);
++      CloseHandle(s->done);
++      free(s);
++      return FALSE;
++   }
++   t->thread = h;
++   t->done = done;
++   return TRUE;
++}
++
++static inline void
++npt_thread_join(struct npt_thread *t)
++{
++   if (t->done) {
++      WaitForSingleObject(t->done, INFINITE);
++      CloseHandle(t->done);
++   }
++   if (t->thread)
++      CloseHandle(t->thread);
++   t->thread = NULL;
++   t->done = NULL;
++}
++
++#endif /* _WIN32 */
++
++#endif /* NPT_WIN32_THREAD_H */

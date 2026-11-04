@@ -1,0 +1,324 @@
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 4b180e5..ffa157b 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -102,6 +102,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
+ #else
+     VK_EXTENSION(KHR_EXTERNAL_MEMORY_FD, KHR_external_memory_fd),
+     VK_EXTENSION(EXT_EXTERNAL_MEMORY_DMA_BUF, EXT_external_memory_dma_buf),
++    VK_EXTENSION(EXT_IMAGE_DRM_FORMAT_MODIFIER, EXT_image_drm_format_modifier),
+ #endif
+     VK_EXTENSION(KHR_INDEX_TYPE_UINT8, KHR_index_type_uint8),
+     VK_EXTENSION(KHR_SHADER_FLOAT_CONTROLS_2, KHR_shader_float_controls2),
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 4e95f0d..0e33604 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -638,9 +638,146 @@ struct vkd3d_image_create_info
+     VkExternalMemoryImageCreateInfo external_info;
+     VkImageFormatListCreateInfo format_list;
+     VkImageAlignmentControlCreateInfoMESA image_alignment_control;
++#ifndef _WIN32
++    VkImageDrmFormatModifierListCreateInfoEXT modifier_list;
++    uint64_t modifiers[32];
++#endif
+     VkImageCreateInfo image_info;
+ };
+ 
++#ifndef _WIN32
++#define VKD3D_DRM_FORMAT_MOD_LINEAR 0ull
++
++/* Can an image with these parameters be created with this DRM format
++ * modifier and shared as a dmabuf? */
++static bool vkd3d_dmabuf_modifier_usable(struct d3d12_device *device,
++        const VkImageCreateInfo *image_info, const VkDrmFormatModifierPropertiesEXT *props)
++{
++    const struct vkd3d_vk_instance_procs *vk_procs = &device->vkd3d_instance->vk_procs;
++    VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifier_info;
++    VkPhysicalDeviceExternalImageFormatInfo external_info;
++    VkExternalImageFormatProperties external_properties;
++    VkPhysicalDeviceImageFormatInfo2 format_info;
++    VkImageFormatProperties2 format_properties;
++    VkExternalMemoryFeatureFlags required;
++    VkFormatFeatureFlags features = 0;
++
++    if (image_info->usage & VK_IMAGE_USAGE_SAMPLED_BIT)
++        features |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
++    if (image_info->usage & VK_IMAGE_USAGE_STORAGE_BIT)
++        features |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
++    if (image_info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
++        features |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
++    if (image_info->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
++        features |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
++    if (image_info->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
++        features |= VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
++    if (image_info->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
++        features |= VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
++
++    if ((props->drmFormatModifierTilingFeatures & features) != features)
++        return false;
++
++    memset(&modifier_info, 0, sizeof(modifier_info));
++    modifier_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT;
++    modifier_info.drmFormatModifier = props->drmFormatModifier;
++    modifier_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++
++    memset(&external_info, 0, sizeof(external_info));
++    external_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
++    external_info.pNext = &modifier_info;
++    external_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++
++    memset(&format_info, 0, sizeof(format_info));
++    format_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
++    format_info.pNext = &external_info;
++    format_info.format = image_info->format;
++    format_info.type = image_info->imageType;
++    format_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++    format_info.usage = image_info->usage;
++    format_info.flags = image_info->flags;
++
++    memset(&external_properties, 0, sizeof(external_properties));
++    external_properties.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES;
++    memset(&format_properties, 0, sizeof(format_properties));
++    format_properties.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
++    format_properties.pNext = &external_properties;
++
++    if (VK_CALL(vkGetPhysicalDeviceImageFormatProperties2(device->vk_physical_device,
++            &format_info, &format_properties)) != VK_SUCCESS)
++        return false;
++
++    required = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
++    if ((external_properties.externalMemoryProperties.externalMemoryFeatures & required) != required)
++        return false;
++
++    return image_info->extent.width <= format_properties.imageFormatProperties.maxExtent.width &&
++            image_info->extent.height <= format_properties.imageFormatProperties.maxExtent.height &&
++            image_info->mipLevels <= format_properties.imageFormatProperties.maxMipLevels &&
++            image_info->arrayLayers <= format_properties.imageFormatProperties.maxArrayLayers;
++}
++
++/* A linear-requested dmabuf export stays LINEAR where the driver can share
++ * that layout.  Where it can't (NVIDIA offers no shareable LINEAR modifier
++ * for scanout formats), use the driver's own modifiers instead: the
++ * descriptor carries the modifier, so a modifier-aware importer such as
++ * DXVK still opens it.  DXVK's export path does the same. */
++static void vkd3d_select_dmabuf_modifiers(struct d3d12_device *device,
++        struct d3d12_resource *resource, struct vkd3d_image_create_info *create_info)
++{
++    const struct vkd3d_vk_instance_procs *vk_procs = &device->vkd3d_instance->vk_procs;
++    VkDrmFormatModifierPropertiesEXT *props = NULL;
++    VkImageCreateInfo *image_info = &create_info->image_info;
++    VkDrmFormatModifierPropertiesListEXT list;
++    VkFormatProperties2 format_properties;
++    uint32_t i, count = 0;
++    bool linear = false;
++
++    if (!device->vk_info.EXT_image_drm_format_modifier)
++        return;
++
++    memset(&list, 0, sizeof(list));
++    list.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT;
++    memset(&format_properties, 0, sizeof(format_properties));
++    format_properties.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
++    format_properties.pNext = &list;
++    VK_CALL(vkGetPhysicalDeviceFormatProperties2(device->vk_physical_device,
++            image_info->format, &format_properties));
++
++    if (!list.drmFormatModifierCount ||
++            !(props = vkd3d_calloc(list.drmFormatModifierCount, sizeof(*props))))
++        return;
++
++    list.pDrmFormatModifierProperties = props;
++    VK_CALL(vkGetPhysicalDeviceFormatProperties2(device->vk_physical_device,
++            image_info->format, &format_properties));
++
++    for (i = 0; i < list.drmFormatModifierCount; i++)
++    {
++        if (!vkd3d_dmabuf_modifier_usable(device, image_info, &props[i]))
++            continue;
++        if (props[i].drmFormatModifier == VKD3D_DRM_FORMAT_MOD_LINEAR)
++            linear = true;
++        else if (count < ARRAY_SIZE(create_info->modifiers))
++            create_info->modifiers[count++] = props[i].drmFormatModifier;
++    }
++    vkd3d_free(props);
++
++    if (linear || !count)
++        return;
++
++    WARN("No shareable LINEAR layout for format %u, usage %#x; exporting with %u driver modifier(s).\n",
++            image_info->format, image_info->usage, count);
++
++    create_info->modifier_list.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT;
++    create_info->modifier_list.drmFormatModifierCount = count;
++    create_info->modifier_list.pDrmFormatModifiers = create_info->modifiers;
++    vk_prepend_struct(image_info, &create_info->modifier_list);
++    image_info->tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++    resource->flags |= VKD3D_RESOURCE_DMABUF_MODIFIER;
++}
++#endif
++
+ static bool d3d12_device_should_use_image_compression_control(struct d3d12_device *device)
+ {
+     /* NV does not support this extension, but if they did, we wouldn't want to use it.
+@@ -1128,6 +1265,11 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
+         image_info->extent = d3d12_resource_desc_get_padded_feedback_extent(desc);
+     }
+ 
++#ifndef _WIN32
++    if (resource && (resource->flags & VKD3D_RESOURCE_LINEAR_DMABUF_EXPORT))
++        vkd3d_select_dmabuf_modifiers(device, resource, create_info);
++#endif
++
+     if (resource)
+     {
+         /* Cases where we need to force images into GENERAL layout at all times.
+@@ -1138,6 +1280,7 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
+         if (d3d12_device_supports_unified_layouts(device) ||
+                 (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) ||
+                 (image_info->tiling == VK_IMAGE_TILING_LINEAR) ||
++                (image_info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) ||
+                 (image_info->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) ||
+                 (heap_properties && is_cpu_accessible_heap(heap_properties)))
+         {
+@@ -4611,6 +4754,34 @@ fail:
+ }
+ 
+ #ifndef _WIN32
++static uint32_t vkd3d_dmabuf_modifier_plane_count(struct d3d12_device *device,
++        VkFormat format, uint64_t modifier)
++{
++    const struct vkd3d_vk_instance_procs *vk_procs = &device->vkd3d_instance->vk_procs;
++    VkDrmFormatModifierPropertiesEXT *props;
++    VkDrmFormatModifierPropertiesListEXT list;
++    VkFormatProperties2 format_properties;
++    uint32_t i, planes = 0;
++
++    memset(&list, 0, sizeof(list));
++    list.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT;
++    memset(&format_properties, 0, sizeof(format_properties));
++    format_properties.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
++    format_properties.pNext = &list;
++    VK_CALL(vkGetPhysicalDeviceFormatProperties2(device->vk_physical_device, format, &format_properties));
++    if (!list.drmFormatModifierCount || !(props = vkd3d_calloc(list.drmFormatModifierCount, sizeof(*props))))
++        return 0;
++    list.pDrmFormatModifierProperties = props;
++    VK_CALL(vkGetPhysicalDeviceFormatProperties2(device->vk_physical_device, format, &format_properties));
++    for (i = 0; i < list.drmFormatModifierCount; i++)
++    {
++        if (props[i].drmFormatModifier == modifier)
++            planes = props[i].drmFormatModifierPlaneCount;
++    }
++    vkd3d_free(props);
++    return planes;
++}
++
+ static HRESULT d3d12_resource_build_native_shared_descriptor(struct d3d12_resource *resource,
+         struct d3d12_device *device, dxn_shared_texture **out_descriptor)
+ {
+@@ -4619,6 +4790,7 @@ static HRESULT d3d12_resource_build_native_shared_descriptor(struct d3d12_resour
+     VkImageSubresource subresource;
+     VkMemoryGetFdInfoKHR fd_info;
+     VkSubresourceLayout layout;
++    unsigned int plane;
+     int fd = -1;
+     VkResult vr;
+ 
+@@ -4672,10 +4844,6 @@ static HRESULT d3d12_resource_build_native_shared_descriptor(struct d3d12_resour
+         return E_OUTOFMEMORY;
+     }
+ 
+-    memset(&subresource, 0, sizeof(subresource));
+-    subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+-    VK_CALL(vkGetImageSubresourceLayout(device->vk_device, resource->res.vk_image, &subresource, &layout));
+-
+     DXN_SHARED_INIT(descriptor, DXN_SHARED_TEXTURE_MAGIC);
+ 
+     descriptor->meta.width = resource->desc.Width;
+@@ -4693,8 +4861,44 @@ static HRESULT d3d12_resource_build_native_shared_descriptor(struct d3d12_resour
+ 
+     descriptor->drm_modifier = 0; /* DRM_FORMAT_MOD_LINEAR */
+     descriptor->plane_count = 1;
+-    descriptor->planes[0].offset = layout.offset;
+-    descriptor->planes[0].pitch = layout.rowPitch;
++
++    if (resource->flags & VKD3D_RESOURCE_DMABUF_MODIFIER)
++    {
++        VkImageDrmFormatModifierPropertiesEXT modifier_props;
++
++        memset(&modifier_props, 0, sizeof(modifier_props));
++        modifier_props.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT;
++        if ((vr = VK_CALL(vkGetImageDrmFormatModifierPropertiesEXT(device->vk_device,
++                resource->res.vk_image, &modifier_props))) < 0)
++        {
++            ERR("Failed to query the image's DRM format modifier, vr %d.\n", vr);
++            vkd3d_free(descriptor);
++            close(fd);
++            return hresult_from_vk_result(vr);
++        }
++        descriptor->drm_modifier = modifier_props.drmFormatModifier;
++        descriptor->plane_count = vkd3d_dmabuf_modifier_plane_count(device,
++                resource->format->vk_format, modifier_props.drmFormatModifier);
++        if (!descriptor->plane_count || descriptor->plane_count > DXN_SHARED_MAX_PLANES)
++        {
++            ERR("Unexpected plane count %u for DRM format modifier %#"PRIx64".\n",
++                    descriptor->plane_count, (uint64_t)modifier_props.drmFormatModifier);
++            vkd3d_free(descriptor);
++            close(fd);
++            return E_FAIL;
++        }
++    }
++
++    for (plane = 0; plane < descriptor->plane_count; plane++)
++    {
++        memset(&subresource, 0, sizeof(subresource));
++        subresource.aspectMask = (resource->flags & VKD3D_RESOURCE_DMABUF_MODIFIER)
++                ? (VkImageAspectFlags)(VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT << plane)
++                : VK_IMAGE_ASPECT_COLOR_BIT;
++        VK_CALL(vkGetImageSubresourceLayout(device->vk_device, resource->res.vk_image, &subresource, &layout));
++        descriptor->planes[plane].offset = layout.offset;
++        descriptor->planes[plane].pitch = layout.rowPitch;
++    }
+     descriptor->size = resource->mem.device_allocation.size;
+     descriptor->fd = fd;
+ 
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 2d6880d..85353b1 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -142,6 +142,7 @@ struct vkd3d_vulkan_info
+     bool KHR_external_semaphore_win32;
+     bool KHR_external_memory_fd;
+     bool EXT_external_memory_dma_buf;
++    bool EXT_image_drm_format_modifier;
+     bool KHR_present_wait2;
+     bool KHR_present_id2;
+     bool KHR_present_wait;
+@@ -1102,7 +1103,10 @@ enum vkd3d_resource_flag
+     VKD3D_RESOURCE_COPY_QUEUE_COMPATIBLE  = (1u << 10),
+     VKD3D_RESOURCE_INPUT_ATTACHMENT       = (1u << 11),
+     /* Native-only: shared resource exports its dmabuf with LINEAR tiling. */
+-    VKD3D_RESOURCE_LINEAR_DMABUF_EXPORT   = (1u << 12)
++    VKD3D_RESOURCE_LINEAR_DMABUF_EXPORT   = (1u << 12),
++    /* Native-only: a linear-requested export the driver cannot share as
++     * LINEAR (NVIDIA) uses one of the driver's DRM format modifiers. */
++    VKD3D_RESOURCE_DMABUF_MODIFIER        = (1u << 13)
+ };
+ 
+ #define VKD3D_INVALID_TILE_INDEX (~0u)
+diff --git a/libs/vkd3d/vulkan_procs.h b/libs/vkd3d/vulkan_procs.h
+index 9e0a736..b1176ce 100644
+--- a/libs/vkd3d/vulkan_procs.h
++++ b/libs/vkd3d/vulkan_procs.h
+@@ -266,6 +266,11 @@ VK_DEVICE_EXT_PFN(vkGetMemoryFdKHR)
+ VK_DEVICE_EXT_PFN(vkGetMemoryFdPropertiesKHR)
+ #endif
+ 
++#ifdef VK_EXT_image_drm_format_modifier
++/* VK_EXT_image_drm_format_modifier */
++VK_DEVICE_EXT_PFN(vkGetImageDrmFormatModifierPropertiesEXT)
++#endif
++
+ #ifdef VK_KHR_external_semaphore_win32
+ /* VK_KHR_external_semaphore_win32 */
+ VK_DEVICE_EXT_PFN(vkGetSemaphoreWin32HandleKHR)

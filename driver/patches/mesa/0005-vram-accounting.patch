@@ -1,0 +1,405 @@
+diff --git a/src/virtio/neptune/triton/triton.h b/src/virtio/neptune/triton/triton.h
+index a7d5e6c..bb483d3 100644
+--- a/src/virtio/neptune/triton/triton.h
++++ b/src/virtio/neptune/triton/triton.h
+@@ -310,6 +310,11 @@ typedef struct TRITON_RESOURCE {
+     D3DKMT_HANDLE          hImportAlloc;
+     D3DKMT_HANDLE          hImportResKmt;
+ 
++    /* VRAM accounting allocation (tritonKmCreateAccountAlloc) that makes
++     * Windows count this host-only resource's memory; 0 when uncounted. */
++    D3DKMT_HANDLE          hAccountAlloc;
++    UINT64                 AccountBytes;
++
+     ID3D11Resource        *pResource;
+ 
+     /* Single-sample, single-mip, single-slice shared texture a back buffer of
+diff --git a/src/virtio/neptune/triton/tritonKm.c b/src/virtio/neptune/triton/tritonKm.c
+index 4a359d5..fb5ca60 100644
+--- a/src/virtio/neptune/triton/tritonKm.c
++++ b/src/virtio/neptune/triton/tritonKm.c
+@@ -120,14 +120,14 @@ tritonKmLoadFence(volatile const UINT64 *va)
+  * allocations it owns resident, never the ones pfnAllocateCb hands back to
+  * the driver.  Requests are never revoked; the reference dies with the
+  * allocation. */
+-void
+-tritonKmRequestResidency(TRITON_KM *km, D3DKMT_HANDLE hAllocation)
++/* Creates the device's paging queue on first use.  Returns FALSE when the
++ * runtime/KMD pair has no explicit residency (requests are then no-ops). */
++static BOOL
++tritonKmEnsurePagingQueue(TRITON_KM *km)
+ {
+-   if (!hAllocation || !km->pCallbacks)
+-      return;
+    if (!km->PagingQueueTried) {
+       if (!km->pLock)
+-         return;
++         return FALSE;
+       EnterCriticalSection(km->pLock);
+       if (!km->PagingQueueTried) {
+          if (km->pCallbacks->pfnCreatePagingQueueCb &&
+@@ -149,7 +149,15 @@ tritonKmRequestResidency(TRITON_KM *km, D3DKMT_HANDLE hAllocation)
+       }
+       LeaveCriticalSection(km->pLock);
+    }
+-   if (!km->hPagingQueue)
++   return km->hPagingQueue != 0;
++}
++
++void
++tritonKmRequestResidency(TRITON_KM *km, D3DKMT_HANDLE hAllocation)
++{
++   if (!hAllocation || !km->pCallbacks)
++      return;
++   if (!tritonKmEnsurePagingQueue(km))
+       return;
+ 
+    D3DDDI_MAKERESIDENT mr;
+@@ -241,3 +249,215 @@ tritonKmFillSharedExchange(VIOGPU_CREATE_ALLOCATION_EXCHANGE *ax,
+       ax->Size = ((d->Width * d->Height * 4) + 4095) & ~4095ull;
+    return TRUE;
+ }
++
++/* ---------- VRAM accounting ---------- */
++
++/* pid<<32 | counter keeps bits 62/63 clear for the KMD's namespaces; bit 31
++ * of the counter word separates this minter from the transport's
++ * (npt_mint_alloc_cookie) in the same process. */
++ULONGLONG
++tritonKmMintAllocCookie(void)
++{
++   static volatile LONG counter;
++   return ((ULONGLONG)GetCurrentProcessId() << 32) | 0x80000000ull |
++          ((ULONG)InterlockedIncrement(&counter) & 0x7fffffffu);
++}
++
++/* Bytes per texel, or per 4x4 block for block-compressed formats
++ * (*pBlock set).  Unknown formats count as 4 bytes per texel. */
++static UINT
++tritonKmFormatBytes(DXGI_FORMAT f, BOOL *pBlock)
++{
++   *pBlock = FALSE;
++   const UINT v = (UINT)f;
++   if (v >= 1 && v <= 4)   return 16;  /* R32G32B32A32 */
++   if (v >= 5 && v <= 8)   return 12;  /* R32G32B32 */
++   if (v >= 9 && v <= 22)  return 8;   /* R16G16B16A16, R32G32, R32G8X24 */
++   if (v >= 23 && v <= 47) return 4;   /* R10G10B10A2 .. X24_G8 */
++   if (v >= 48 && v <= 59) return 2;   /* R8G8, R16, D16 */
++   if (v >= 60 && v <= 66) return 1;   /* R8, A8, R1 */
++   if (v >= 67 && v <= 69) return 4;   /* R9G9B9E5, packed 4:2:2 RGB */
++   if ((v >= 70 && v <= 72) || (v >= 79 && v <= 81)) {
++      *pBlock = TRUE;                   /* BC1, BC4 */
++      return 8;
++   }
++   if ((v >= 73 && v <= 78) || (v >= 82 && v <= 84) || (v >= 94 && v <= 99)) {
++      *pBlock = TRUE;                   /* BC2, BC3, BC5, BC6H, BC7 */
++      return 16;
++   }
++   if (v == 85 || v == 86) return 2;   /* B5G6R5, B5G5R5A1 */
++   if (v >= 87 && v <= 93) return 4;   /* B8G8R8A8/X8 family */
++   if (v == 115) return 2;             /* B4G4R4A4 */
++   return 4;
++}
++
++UINT64
++tritonKmEstimateResourceBytes(const D3D11DDIARG_CREATERESOURCE *a)
++{
++   if (!a->pMipInfoList || a->MipLevels == 0)
++      return 0;
++   if (a->ResourceDimension == D3D10DDIRESOURCE_BUFFER ||
++       a->ResourceDimension == D3D11DDIRESOURCE_BUFFEREX)
++      return a->pMipInfoList[0].TexelWidth;
++
++   BOOL block;
++   const UINT64 bpe = tritonKmFormatBytes(a->Format, &block);
++   UINT64 perSlice = 0;
++   for (UINT m = 0; m < a->MipLevels; m++) {
++      UINT64 w = a->pMipInfoList[m].TexelWidth  ? a->pMipInfoList[m].TexelWidth  : 1;
++      UINT64 h = a->pMipInfoList[m].TexelHeight ? a->pMipInfoList[m].TexelHeight : 1;
++      UINT64 d = a->pMipInfoList[m].TexelDepth  ? a->pMipInfoList[m].TexelDepth  : 1;
++      if (block) {
++         w = (w + 3) / 4;
++         h = (h + 3) / 4;
++      }
++      perSlice += w * h * d * bpe;
++   }
++   UINT64 slices = a->ArraySize ? a->ArraySize : 1;
++   if (a->ResourceDimension == D3D10DDIRESOURCE_TEXTURECUBE && a->ArraySize == 0)
++      slices = 6;
++   const UINT64 samples = a->SampleDesc.Count ? a->SampleDesc.Count : 1;
++   return perSlice * slices * samples;
++}
++
++/* Below this a resource is not counted: small buffers and textures come and
++ * go by the thousand and add up to little next to the large textures that
++ * make up a game's memory use. */
++#define TRITON_KM_ACCOUNT_MIN_BYTES (128u * 1024u)
++
++static BOOL
++tritonKmAccountingEnabled(void)
++{
++   static volatile LONG state; /* 0 unknown, 1 on, 2 off */
++   LONG s = state;
++   if (s == 0) {
++      char buf[8] = {0};
++      DWORD n = GetEnvironmentVariableA("NPT_VRAM_ACCOUNT", buf, sizeof(buf));
++      s = (n > 0 && n < sizeof(buf) && buf[0] == '0') ? 2 : 1;
++      InterlockedExchange(&state, s);
++   }
++   return s == 1;
++}
++
++/* Process-wide accounting statistics, reported through OutputDebugString
++ * (DebugView, "Capture Win32") so a user can see whether a game's memory is
++ * being counted and whether it is ever given back:
++ *   - the first few failures of each kind, with the HRESULT;
++ *   - a summary line each time the live counted size crosses another
++ *     256 MB step, up or down. */
++static volatile LONG64 g_AccLive;      /* bytes currently counted */
++static volatile LONG64 g_AccLiveCount; /* allocations currently counted */
++static volatile LONG   g_AccOk, g_AccAllocFail, g_AccResFail, g_AccPending;
++static volatile LONG   g_AccNoQueue, g_AccStep;
++static volatile LONG   g_ResCreated, g_ResDestroyed;
++
++#define TRITON_KM_ACCOUNT_LOG_STEP (256ull << 20)
++
++static void
++tritonKmAccountReport(const char *why)
++{
++   const LONG64 live = g_AccLive;
++   const LONG step = (LONG)(live / (LONG64)TRITON_KM_ACCOUNT_LOG_STEP);
++   const LONG prev = InterlockedExchange(&g_AccStep, step);
++   if (why == NULL && prev == step)
++      return;
++   TR_LOG("vram-account pid %lu: %s live %lld MB in %lld allocs; ok %ld, "
++          "pending %ld, alloc failed %ld, resident failed %ld, no queue %ld; "
++          "resources created %ld destroyed %ld",
++          (unsigned long)GetCurrentProcessId(), why ? why : "step",
++          (long long)(live >> 20), (long long)g_AccLiveCount, g_AccOk,
++          g_AccPending, g_AccAllocFail, g_AccResFail, g_AccNoQueue,
++          g_ResCreated, g_ResDestroyed);
++}
++
++void
++tritonKmNoteResource(BOOL created)
++{
++   const LONG n = created ? InterlockedIncrement(&g_ResCreated)
++                          : InterlockedIncrement(&g_ResDestroyed);
++   /* Every 1000 creates or destroys, so destroys of uncounted (small or
++    * CPU-side) resources show up even when no counted one is freed. */
++   if (n % 1000 == 0)
++      tritonKmAccountReport(created ? "res+1000;" : "res-1000;");
++}
++
++void
++tritonKmAccountNoteFree(UINT64 bytes)
++{
++   InterlockedAdd64(&g_AccLive, -(LONG64)bytes);
++   InterlockedDecrement64(&g_AccLiveCount);
++   tritonKmAccountReport(NULL);
++}
++
++D3DKMT_HANDLE
++tritonKmCreateAccountAlloc(TRITON_KM *km, UINT64 bytes)
++{
++   if (bytes < TRITON_KM_ACCOUNT_MIN_BYTES || !km->pCallbacks ||
++       !km->pCallbacks->pfnAllocateCb || !tritonKmAccountingEnabled())
++      return 0;
++   if (!tritonKmEnsurePagingQueue(km)) {
++      if (InterlockedIncrement(&g_AccNoQueue) <= 3)
++         tritonKmAccountReport("no paging queue;");
++      return 0;
++   }
++
++   VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX ax;
++   memset(&ax, 0, sizeof(ax));
++   ax.Base.Type = VIOGPU_RESOURCE_TYPE_BLOB;
++   ax.Base.OptionsBlob.blob_mem   = VIOGPU_BLOB_MEM_HOST3D;
++   ax.Base.OptionsBlob.blob_flags = VIOGPU_BLOB_FLAG_RESIDENCY_ONLY |
++                                    VIOGPU_BLOB_FLAG_VRAM_ACCOUNT;
++   ax.Base.OptionsBlob.blob_id    = 0;
++   ax.Base.Size                   = (bytes + 4095ull) & ~4095ull;
++   ax.LookupCookie                = tritonKmMintAllocCookie();
++
++   D3DDDI_ALLOCATIONINFO2 ai;
++   memset(&ai, 0, sizeof(ai));
++   ai.pPrivateDriverData    = &ax;
++   ai.PrivateDriverDataSize = sizeof(ax);
++
++   /* A device allocation (no runtime resource): the runtime never sees it
++    * as part of the app's resource. */
++   D3DDDICB_ALLOCATE cb;
++   memset(&cb, 0, sizeof(cb));
++   cb.NumAllocations   = 1;
++   cb.pAllocationInfo2 = &ai;
++
++   HRESULT hr = km->pCallbacks->pfnAllocateCb(km->hRTDevice, &cb);
++   if (FAILED(hr) || !ai.hAllocation) {
++      if (InterlockedIncrement(&g_AccAllocFail) <= 4)
++         TR_LOG("vram-account pid %lu: allocate (%llu bytes) failed 0x%08lx",
++                (unsigned long)GetCurrentProcessId(),
++                (unsigned long long)bytes, (unsigned long)hr);
++      return 0;
++   }
++
++   /* Nothing ever references this allocation in a DMA buffer, so the
++    * paging fence is not waited on: E_PENDING just means VidMm will make it
++    * resident shortly. */
++   D3DDDI_MAKERESIDENT mr;
++   memset(&mr, 0, sizeof(mr));
++   mr.hPagingQueue   = km->hPagingQueue;
++   mr.NumAllocations = 1;
++   mr.AllocationList = &ai.hAllocation;
++   hr = km->pCallbacks->pfnMakeResidentCb(km->hRTDevice, &mr);
++   if (FAILED(hr) && hr != E_PENDING) {
++      if (InterlockedIncrement(&g_AccResFail) <= 4)
++         TR_LOG("vram-account pid %lu: MakeResident (%llu bytes) failed 0x%08lx",
++                (unsigned long)GetCurrentProcessId(),
++                (unsigned long long)bytes, (unsigned long)hr);
++      D3DDDICB_DEALLOCATE da;
++      memset(&da, 0, sizeof(da));
++      da.NumAllocations = 1;
++      da.HandleList     = &ai.hAllocation;
++      km->pCallbacks->pfnDeallocateCb(km->hRTDevice, &da);
++      return 0;
++   }
++   if (hr == E_PENDING)
++      InterlockedIncrement(&g_AccPending);
++   const LONG ok = InterlockedIncrement(&g_AccOk);
++   InterlockedAdd64(&g_AccLive, (LONG64)bytes);
++   InterlockedIncrement64(&g_AccLiveCount);
++   tritonKmAccountReport(ok == 1 ? "first;" : NULL);
++   return ai.hAllocation;
++}
+diff --git a/src/virtio/neptune/triton/tritonKm.h b/src/virtio/neptune/triton/tritonKm.h
+index 879f031..32852f9 100644
+--- a/src/virtio/neptune/triton/tritonKm.h
++++ b/src/virtio/neptune/triton/tritonKm.h
+@@ -55,6 +55,26 @@ HRESULT tritonKmEscape(const TRITON_KM *km, VIOGPU_ESCAPE *esc);
+ void    tritonKmEnsureRuntimeCtx(TRITON_KM *km);
+ void    tritonKmRequestResidency(TRITON_KM *km, D3DKMT_HANDLE hAllocation);
+ 
++/* Process-unique cookie for VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX, shared by
++ * the D3D11 and D3D12 halves so their cookies never collide. */
++ULONGLONG tritonKmMintAllocCookie(void);
++
++/* Bytes of GPU memory a D3D11 resource of this shape occupies (estimate:
++ * texel size x every mip, slice and sample).  0 when unknown. */
++UINT64  tritonKmEstimateResourceBytes(const D3D11DDIARG_CREATERESOURCE *a);
++
++/* VRAM accounting: a KM allocation that stands for a host-only resource of
++ * `bytes`, resident in the local segment, so Windows counts the memory in
++ * the process's video memory usage and budget (QueryVideoMemoryInfo).  No
++ * host resource and no guest memory back it.  Returns 0 when accounting is
++ * off (NPT_VRAM_ACCOUNT=0), the resource is small, or anything fails: the
++ * resource then simply goes uncounted. */
++D3DKMT_HANDLE tritonKmCreateAccountAlloc(TRITON_KM *km, UINT64 bytes);
++/* Counts a freed accounting allocation of `bytes` (as passed to create). */
++void tritonKmAccountNoteFree(UINT64 bytes);
++/* Counts every created (TRUE) and destroyed (FALSE) D3D11 resource. */
++void tritonKmNoteResource(BOOL created);
++
+ /* The D3D11 description of a texture being exported as a shared blob. */
+ typedef struct TRITON_KM_SHARED_DESC {
+     UINT64       Width;
+diff --git a/src/virtio/neptune/triton/tritonPresent12.c b/src/virtio/neptune/triton/tritonPresent12.c
+index 8cdbe13..5195a5c 100644
+--- a/src/virtio/neptune/triton/tritonPresent12.c
++++ b/src/virtio/neptune/triton/tritonPresent12.c
+@@ -106,17 +106,9 @@ triton12RegisterSharedBlob(PTRITON12_DEVICE p, PTRITON12_RESOURCE r,
+ 
+ /* ---------- residency-only KM allocation ---------- */
+ 
+-/* Unique-per-live-allocation cookie (wddm_hw.h): pid<<32 | counter keeps
+- * bits 62/63 clear for the KMD's namespaces; bit 31 of the counter word
+- * separates this minter from the transport's (npt_mint_alloc_cookie) in
+- * the same process. */
+-static ULONGLONG
+-t12MintAllocCookie(void)
+-{
+-    static volatile LONG counter;
+-    return ((ULONGLONG)GetCurrentProcessId() << 32) | 0x80000000ull |
+-           ((ULONG)InterlockedIncrement(&counter) & 0x7fffffffu);
+-}
++/* Cookies come from tritonKmMintAllocCookie, shared with the D3D11 half so
++ * the two never mint the same value in one process. */
++#define t12MintAllocCookie tritonKmMintAllocCookie
+ 
+ D3DKMT_HANDLE
+ triton12AllocResidencyOnly(PTRITON12_DEVICE p, HANDLE hRTResource)
+diff --git a/src/virtio/neptune/triton/tritonResource.c b/src/virtio/neptune/triton/tritonResource.c
+index e47217f..add9190 100644
+--- a/src/virtio/neptune/triton/tritonResource.c
++++ b/src/virtio/neptune/triton/tritonResource.c
+@@ -217,6 +217,8 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
+     r->IsShared         = FALSE;
+     r->hImportAlloc     = 0;
+     r->hImportResKmt    = 0;
++    r->hAccountAlloc    = 0;
++    r->AccountBytes     = 0;
+ 
+     /* Non-primary TEXTURE2D with MISC_SHARED: emulate the shared handle.
+      * Display primaries take the host-swapchain route below.
+@@ -451,6 +453,21 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
+         return;
+     }
+ 
++    tritonKmNoteResource(TRUE);
++
++    /* Host-only GPU memory is invisible to Windows: without a KM
++     * allocation the video memory manager reports ~0 usage, so a game's
++     * budget (QueryVideoMemoryInfo) never fills and its texture streaming
++     * grows until the host GPU spills into host RAM.  Count DEFAULT and
++     * IMMUTABLE resources (the ones that live in VRAM); shared ones already
++     * own an allocation. */
++    if (!isShared && (usage == D3D11_USAGE_DEFAULT || usage == D3D11_USAGE_IMMUTABLE)) {
++        const UINT64 bytes = tritonKmEstimateResourceBytes(pArgs);
++        r->hAccountAlloc = tritonKmCreateAccountAlloc(&pD->Km, bytes);
++        if (r->hAccountAlloc)
++            r->AccountBytes = bytes;
++    }
++
+     if (isShared) {
+         if (!tritonRegisterSharedBlob(pD, r, r->pResource, (UINT)usage, bind,
+                                       cpuAccess, misc, r->Format, FALSE))
+@@ -519,12 +536,24 @@ tritonDestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource)
+     if (r->pResource) {
+         ID3D11Resource_Release(r->pResource);
+         r->pResource = NULL;
++        tritonKmNoteResource(FALSE);
+     }
+     if (r->pPresentCompanion) {
+         ID3D11Resource_Release(r->pPresentCompanion);
+         r->pPresentCompanion = NULL;
+     }
+ 
++    if (r->hAccountAlloc && pD && pD->KTCallbacks.pfnDeallocateCb) {
++        D3DDDICB_DEALLOCATE da;
++        memset(&da, 0, sizeof(da));
++        da.NumAllocations = 1;
++        da.HandleList     = &r->hAccountAlloc;
++        pD->KTCallbacks.pfnDeallocateCb(pD->hRTDevice.handle, &da);
++        r->hAccountAlloc = 0;
++        tritonKmAccountNoteFree(r->AccountBytes);
++        r->AccountBytes = 0;
++    }
++
+     /* Exporter: the KM allocation owns the virtio blob; deallocating it
+      * unrefs the host resource once every opener has closed. */
+     if (r->hKMAllocation && pD && pD->KTCallbacks.pfnDeallocateCb) {
+diff --git a/src/virtio/virtio-gpu/wddm_hw.h b/src/virtio/virtio-gpu/wddm_hw.h
+index e2da5c4..c82e06a 100644
+--- a/src/virtio/virtio-gpu/wddm_hw.h
++++ b/src/virtio/virtio-gpu/wddm_hw.h
+@@ -369,6 +369,11 @@ typedef struct _VIOGPU_RESOURCE_3D_OPTIONS
+ // inside the D3D12 runtime, which rejects an object owning no allocation with
+ // E_INVALIDARG without ever consulting the driver.
+ #define VIOGPU_BLOB_FLAG_RESIDENCY_ONLY   0x0010
++// With RESIDENCY_ONLY: the blob stands for a host-only D3D11 resource of
++// its Size.  It is placed in the local (host shmem) segment with no CPU
++// access and no backing, so the video memory manager counts that memory in
++// the process's local usage and budget.  Nothing reads or writes it.
++#define VIOGPU_BLOB_FLAG_VRAM_ACCOUNT     0x0020
+ #pragma pack(1)
+ typedef struct _VIOGPU_RESOURCE_BLOB_OPTIONS
+ {

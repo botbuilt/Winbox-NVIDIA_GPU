@@ -53,6 +53,14 @@ Neptune module through `NPT_D3D11_LIBRARY_PATH` / `NPT_DXGI_LIBRARY_PATH`.
   whose driver leaves junk in the upper half of the 64-bit size. Without
   it, 32-bit DirectX 11 games hang on a black screen. The guest driver in
   `driver/` fixes the cause; this keeps the stock driver working too.
+- `0005`: tell the guest the host takes DXIL shaders (shader model 6).
+  vkd3d-proton compiles them with dxil-spirv. Mesa's OpenGL on Direct3D 12
+  needs this to run on the GPU; on Windows 10 it also needs driver 58120 or
+  newer, which offers Windows 10's older D3D12 driver interface.
+- `0006`: when the container has no `/dev/udmabuf`, share CPU-visible
+  Direct3D 12 memory with Windows as a host pointer (vkd3d-proton's
+  `0002`) instead. Without it, data the GPU writes back for the CPU
+  (readbacks, such as OpenGL `glReadPixels`) never reaches Windows.
 
 `dxvk-patches/` (DXVK):
 
@@ -60,3 +68,16 @@ Neptune module through `NPT_D3D11_LIBRARY_PATH` / `NPT_DXGI_LIBRARY_PATH`.
   linear one for a scanout texture, and log the linear modifier's
   features.
 - `0002`: store A8 textures as R8, since A8 has no DRM format to share.
+
+`vkd3d-patches/` ([vkd3d-proton](https://github.com/osy/vkd3d-proton), the
+host side of Direct3D 12):
+
+- `0001`: the same fallback as DXVK's `0001` for Direct3D 12 textures the
+  guest shares (a game's frames that the desktop shows): when the driver
+  has no shareable linear layout, export with one of its own DRM format
+  modifiers, which DXVK imports. Without it NVIDIA cards show a black
+  screen as soon as a Direct3D 12 or OpenGL-on-D3D12 game presents.
+- `0002`: add `vkd3d_open_existing_heap_from_host_pointer`, which wraps
+  memory the host already has mapped (Windows' shared memory) as a
+  Direct3D 12 heap through `VK_EXT_external_memory_host`. It is the
+  no-udmabuf twin of the dmabuf import.

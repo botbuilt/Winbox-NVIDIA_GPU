@@ -21,6 +21,7 @@ ARG VERSION_ARG="0.0.0"
 ARG QEMU_REF="ae92cdc41fb0b0dab36c6ac724e1729ffc47ef18"
 ARG VIRGL_REF="451505ad0aa449290f2c0672da6877d57ee770e5"
 ARG DXVK_REF="389d26b360b0080f4ffe816779960745434aef6a"
+ARG VKD3D_REF="a8b7cd423d85ff2759a395fd12aae9f0bf123dcc"
 
 ARG DEBIAN_FRONTEND="noninteractive"
 
@@ -35,6 +36,7 @@ RUN <<EOF_BUILD_DEPS
     g++ \
     glslang-tools \
     libvulkan-dev \
+    mingw-w64-tools \
     python3-mako \
     python3-yaml
 
@@ -59,6 +61,7 @@ RUN <<'EOF_SOURCES'
   fetch qemu https://github.com/utmapp/qemu.git "$QEMU_REF"
   fetch virglrenderer https://github.com/utmapp/virglrenderer.git "$VIRGL_REF"
   fetch dxvk https://github.com/osy/dxvk.git "$DXVK_REF"
+  fetch vkd3d-proton https://github.com/osy/vkd3d-proton.git "$VKD3D_REF"
 EOF_SOURCES
 
 # virglrenderer's macos-next branch (it carries the Linux Neptune work too) and
@@ -98,6 +101,42 @@ RUN <<'EOF_DXVK'
   meson install -C /build-dxvk
   ls -l "$PREFIX/lib"
 EOF_DXVK
+
+# vkd3d-proton Native renders the guest's D3D12 on the host's Vulkan. Without
+# it the guest's D3D12 device can't be created, and with it Mesa's OpenGL on
+# D3D12 can't run on the GPU either. widl (mingw-w64-tools) only generates
+# headers from vkd3d's IDL files. The $ORIGIN rpath lets libvkd3d-proton-d3d12
+# find the libvkd3d-proton-d3d12core it loads at run time.
+COPY qemu-triton/vkd3d-patches /tmp/vkd3d-patches
+
+RUN <<'EOF_VKD3D'
+  set -eu
+
+  # NVIDIA offers no shareable linear layout for the guest's scanout
+  # textures either; vkd3d-patches/ falls back to a driver modifier.
+  for patch in /tmp/vkd3d-patches/*.patch; do
+    echo "Applying ${patch##*/}..."
+    git -C /src/vkd3d-proton apply --check "$patch"
+    git -C /src/vkd3d-proton apply "$patch"
+  done
+
+  meson setup /build-vkd3d /src/vkd3d-proton \
+    --buildtype=release \
+    --prefix="$PREFIX" \
+    --libdir=lib \
+    --cross-file /src/vkd3d-proton/build-widl.txt \
+    -Db_ndebug=true \
+    -Denable_tests=false \
+    -Denable_extras=false \
+    -Dc_args=-U_GLIBCXX_ASSERTIONS \
+    -Dcpp_args=-U_GLIBCXX_ASSERTIONS \
+    -Dc_link_args='-Wl,-rpath,$ORIGIN' \
+    -Dcpp_link_args='-Wl,-rpath,$ORIGIN'
+
+  meson compile -C /build-vkd3d
+  meson install -C /build-vkd3d
+  ls -l "$PREFIX/lib"
+EOF_VKD3D
 
 COPY qemu-triton/virgl-patches /tmp/virgl-patches
 
@@ -269,7 +308,8 @@ RUN <<'EOF_VERIFY'
   set -eu
 
   for binary in /usr/bin/qemu-system-x86_64 /opt/neptune/lib/libdxvk_d3d11.so.0 \
-      /opt/neptune/lib/libdxvk_dxgi.so.0 /opt/neptune/libexec/virgl_render_server; do
+      /opt/neptune/lib/libdxvk_dxgi.so.0 /opt/neptune/lib/libvkd3d-proton-d3d12.so \
+      /opt/neptune/lib/libvkd3d-proton-d3d12core.so /opt/neptune/libexec/virgl_render_server; do
     deps="$(ldd "$binary" 2>&1)"
     printf '%s:\n%s\n' "$binary" "$deps"
     if printf '%s\n' "$deps" | grep -q 'not found'; then
@@ -462,6 +502,7 @@ COPY --from=verify /opt/neptune /opt/neptune
 ENV VGA="virtio-vga-gl,neptune=true" \
     NPT_D3D11_LIBRARY_PATH="/opt/neptune/lib/libdxvk_d3d11.so.0" \
     NPT_DXGI_LIBRARY_PATH="/opt/neptune/lib/libdxvk_dxgi.so.0" \
+    NPT_D3D12_LIBRARY_PATH="/opt/neptune/lib/libvkd3d-proton-d3d12.so" \
     DXVK_WSI_DRIVER="Headless"
 
 # Sunshine with the QEMU capture source, started by STREAM=Y.

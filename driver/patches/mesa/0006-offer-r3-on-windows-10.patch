@@ -1,0 +1,33 @@
+diff --git a/src/virtio/neptune/triton/tritonDDI12.c b/src/virtio/neptune/triton/tritonDDI12.c
+index 45d3bb4..fca990a 100644
+--- a/src/virtio/neptune/triton/tritonDDI12.c
++++ b/src/virtio/neptune/triton/tritonDDI12.c
+@@ -159,7 +159,7 @@ triton12GetSupportedVersions(D3D12DDI_HADAPTER hAdapter,
+                              UINT32 *puEntries,
+                              UINT64 *pSupportedDDIInterfaceVersions)
+ {
+-    /* One revision.  A lower revision is not a weaker promise but a
++    /* One revision per table build.  A lower revision is not a weaker promise but a
+      * different one -- smaller tables the fill must know how to populate
+      * -- so the list holds exactly the build FillDDITable assembles:
+      * _0082 (R8) on a host with a DXIL front end, _0022 (R3) without
+@@ -168,11 +168,17 @@ triton12GetSupportedVersions(D3D12DDI_HADAPTER hAdapter,
+      * right after its caps sweep); under R3 the SM 5.1-only list at
+      * FL 11_1 is accepted.  FillDDITable copies the _0022 image for an
+      * R3-sized table. */
++    /* Windows 10's D3D12 runtime predates R8: offered R8 alone, it
++     * closes the adapter right after this call, so a DXIL host also
++     * offers R3.  The runtime takes the newest revision it knows, and
++     * FillDDITable already builds the R3 tables from the runtime's
++     * table sizes; the SM 6.x list does not depend on the revision. */
+     PTRITON12_ADAPTER pAdapter = (PTRITON12_ADAPTER)hAdapter.pDrvPrivate;
+     const BOOL hostDxil = pAdapter && (pAdapter->HostCaps & TRITON_HOSTCAP_DXIL);
+     const UINT64 kSupportedVersions[] = { hostDxil ? D3D12DDI_SUPPORTED_0082
+-                                                   : D3D12DDI_SUPPORTED_0022 };
+-    const UINT32 kCount = 1;
++                                                   : D3D12DDI_SUPPORTED_0022,
++                                          D3D12DDI_SUPPORTED_0022 };
++    const UINT32 kCount = hostDxil ? 2 : 1;
+ 
+     if (!puEntries)
+         return E_INVALIDARG;

@@ -9,14 +9,18 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/botbuilt/Winbox-NVIDIA_GPU/issues</Support>
   <Project>https://github.com/botbuilt/Winbox-NVIDIA_GPU</Project>
-  <Overview>Windows in a box with an NVIDIA GPU: Windows 10/11 (or Server) in a QEMU/KVM virtual machine inside a container, using an NVIDIA card that stays shared with Unraid and your other containers (Plex, Jellyfin, AI apps). Windows gets DirectX 11 on the GPU through the experimental Triton driver, and Moonlight streaming with the video encoded on the GPU (Sunshine with NVENC, CUDA 12) inside the container. Installs itself automatically on first start; watch progress in the WebUI. Also: persistent storage on your array or cache, an Unraid share as drive Z:, optional dedicated VFIO passthrough, and USB passthrough. See the project README for setup.</Overview>
-  <Category>Tools: Productivity:</Category>
+  <Overview>Windows in a box with an NVIDIA GPU: Windows 10/11 (or Server) in a QEMU/KVM virtual machine inside a container, using an NVIDIA card that stays shared with Unraid and your other containers (Plex, Jellyfin, AI apps). Windows gets DirectX 11 on the GPU through the experimental Triton driver (plus early DirectX 12, enough for OpenGL games through Mesa), and Moonlight streaming with the video encoded on the GPU (Sunshine with NVENC, CUDA 12) inside the container. Installs itself automatically on first start; watch progress in the WebUI. Also: persistent storage on your array or cache, an Unraid share as drive Z:, optional dedicated VFIO passthrough, and USB passthrough. See the project README for setup.</Overview>
+  <Category>Productivity: Tools:System</Category>
   <WebUI>http://[IP]:[PORT:8006]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/botbuilt/Winbox-NVIDIA_GPU/main/unraid/winbox.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/dockur/windows/master/.github/logo.png</Icon>
+  <Icon>https://raw.githubusercontent.com/botbuilt/Winbox-NVIDIA_GPU/main/unraid/winbox.png</Icon>
   <ExtraParams>--runtime=nvidia --device=/dev/dri --cap-add=NET_ADMIN --stop-timeout=120 --memory=16g --memory-swap=16g -v /usr/lib64/libnvidia-allocator.so.1:/run/nvidia-host/libnvidia-allocator.so.1:ro -v /usr/lib64/libnvidia-egl-gbm.so.1:/run/nvidia-host/libnvidia-egl-gbm.so.1:ro</ExtraParams>
   <PostArgs/>
   <CPUset/>
+  <Changes>
+### Unreleased
+- First Community Applications version: DirectX 11 on a shared NVIDIA GPU, early DirectX 12 and OpenGL games through Mesa, Moonlight streaming with NVENC.
+  </Changes>
   <Requires>Hardware virtualization (Intel VT-x or AMD-V) enabled in the BIOS. Unraid 7.3 or newer. For DirectX on a shared Nvidia card: the Nvidia Driver plugin with modesetting on, and the Triton driver inside Windows (see README). --memory in Extra Parameters caps the whole container; keep it about 8G above RAM. Without an Nvidia GPU, remove --runtime=nvidia and the two /usr/lib64 mounts from Extra Parameters.</Requires>
 
   <!-- Ports -->

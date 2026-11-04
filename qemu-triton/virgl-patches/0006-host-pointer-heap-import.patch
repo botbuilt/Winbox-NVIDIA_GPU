@@ -1,0 +1,87 @@
+diff --git a/src/neptune/npt_heap12.c b/src/neptune/npt_heap12.c
+index 6db281f..8f79567 100644
+--- a/src/neptune/npt_heap12.c
++++ b/src/neptune/npt_heap12.c
+@@ -33,7 +33,22 @@ struct npt_heap_import {
+ static bool
+ npt_heap12_import_available(const struct npt_d3d_library *lib)
+ {
+-   return lib && lib->pfn_vkd3d_open_existing_heap_from_dmabuf;
++   return lib && (lib->pfn_vkd3d_open_existing_heap_from_dmabuf ||
++                  lib->pfn_vkd3d_open_existing_heap_from_host_pointer);
++}
++
++/* Containers often have no /dev/udmabuf (and on NVIDIA passing it in
++ * breaks other imports), so memfd windows are then imported as a host
++ * pointer through VK_EXT_external_memory_host instead.  Without either
++ * the guest falls back to sync map, whose readback never sees GPU
++ * writes to persistently mapped buffers. */
++static bool
++npt_heap12_have_udmabuf(void)
++{
++   static int have = -1;
++   if (have < 0)
++      have = access("/dev/udmabuf", R_OK | W_OK) == 0;
++   return have;
+ }
+ 
+ /* The window travels as a dmabuf rather than as a host pointer because
+@@ -45,6 +60,24 @@ npt_heap12_import(const struct npt_d3d_library *lib, void *device,
+                   const struct npt_cmd_create_heap_from_shmem *cmd,
+                   void **out_heap)
+ {
++   if (!res->dmabuf_backed && res->u.data &&
++       lib->pfn_vkd3d_open_existing_heap_from_host_pointer &&
++       (!npt_heap12_have_udmabuf() ||
++        !lib->pfn_vkd3d_open_existing_heap_from_dmabuf)) {
++      static bool logged;
++      if (!logged) {
++         logged = true;
++         npt_log("create_heap_from_shmem: no /dev/udmabuf; importing heaps "
++                 "as host pointers");
++      }
++      return lib->pfn_vkd3d_open_existing_heap_from_host_pointer(
++         device, res->u.data + cmd->shmem_offset, cmd->size,
++         &NPT_IID_ID3D12Heap, out_heap);
++   }
++
++   if (!lib->pfn_vkd3d_open_existing_heap_from_dmabuf)
++      return NPT_E_NOTIMPL;
++
+    const int dmabuf_fd = npt_hostmem_blob_dmabuf(
+       res, cmd->shmem_offset, cmd->size, "create_heap_from_shmem");
+    if (dmabuf_fd < 0)
+diff --git a/src/neptune/npt_library.c b/src/neptune/npt_library.c
+index f08ffd7..be5f5a2 100644
+--- a/src/neptune/npt_library.c
++++ b/src/neptune/npt_library.c
+@@ -317,6 +317,13 @@ npt_library_init(struct npt_d3d_library *lib)
+                   .p = npt_library_embedder_sym_optional(
+                      lib->d3d12_module, "vkd3d_",
+                      DXN_SYM_OPEN_EXISTING_HEAP_FROM_DMABUF) }).f;
++            lib->pfn_vkd3d_open_existing_heap_from_host_pointer =
++               ((union { void *p;
++                         HRESULT (*f)(void *, void *, uint64_t, const void *,
++                                      void **); }){
++                  .p = npt_library_embedder_sym_optional(
++                     lib->d3d12_module, "vkd3d_",
++                     "open_existing_heap_from_host_pointer") }).f;
+          }
+ #endif
+       }
+diff --git a/src/neptune/npt_library.h b/src/neptune/npt_library.h
+index 543963a..7a85a0c 100644
+--- a/src/neptune/npt_library.h
++++ b/src/neptune/npt_library.h
+@@ -109,6 +109,11 @@ struct npt_d3d_library {
+     * dmabuf-heap export; CREATE_HEAP_FROM_SHMEM then fails cleanly and
+     * the guest stays on the sync-map path. */
+    PFN_dxn_open_existing_heap_from_dmabuf pfn_vkd3d_open_existing_heap_from_dmabuf;
++   /* Optional WinBox export (vkd3d-patches 0002): host-pointer import for
++    * hosts without /dev/udmabuf. */
++   HRESULT (*pfn_vkd3d_open_existing_heap_from_host_pointer)(
++      void *device, void *address, uint64_t size, const void *iid,
++      void **heap);
+ };
+ 
+ bool
