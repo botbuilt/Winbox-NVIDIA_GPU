@@ -107,8 +107,18 @@ EOF_DXVK
 # D3D12 can't run on the GPU either. widl (mingw-w64-tools) only generates
 # headers from vkd3d's IDL files. The $ORIGIN rpath lets libvkd3d-proton-d3d12
 # find the libvkd3d-proton-d3d12core it loads at run time.
+COPY qemu-triton/vkd3d-patches /tmp/vkd3d-patches
+
 RUN <<'EOF_VKD3D'
   set -eu
+
+  # NVIDIA offers no shareable linear layout for the guest's scanout
+  # textures either; vkd3d-patches/ falls back to a driver modifier.
+  for patch in /tmp/vkd3d-patches/*.patch; do
+    echo "Applying ${patch##*/}..."
+    git -C /src/vkd3d-proton apply --check "$patch"
+    git -C /src/vkd3d-proton apply "$patch"
+  done
 
   meson setup /build-vkd3d /src/vkd3d-proton \
     --buildtype=release \

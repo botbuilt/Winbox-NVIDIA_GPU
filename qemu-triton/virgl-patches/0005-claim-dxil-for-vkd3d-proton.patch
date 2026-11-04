@@ -1,0 +1,18 @@
+diff --git a/src/neptune/npt_renderer.c b/src/neptune/npt_renderer.c
+index 6682af1..d41905a 100644
+--- a/src/neptune/npt_renderer.c
++++ b/src/neptune/npt_renderer.c
+@@ -103,7 +103,12 @@ npt_capset_backend_caps(void)
+     * EXTERNAL_BUFFERS is safe to claim before dxvk is loaded: a dxvk
+     * without the exports answers the guest's first bind with E_NOTIMPL,
+     * and the guest drops back to the map ring. */
+-   return VIRGL_RENDERER_CAPSET_NEPTUNE_CAP_D3D11_EXTERNAL_BUFFERS;
++   /* WinBox: vkd3d-proton takes DXIL through dxil-spirv, and Mesa's
++    * OpenGL on D3D12 only compiles to DXIL (shader model 6), so without
++    * the claim the guest's GL on D3D12 cannot create a single shader.
++    * NPT_CAPSET_CAPS still overrides the whole word. */
++   return VIRGL_RENDERER_CAPSET_NEPTUNE_CAP_D3D11_EXTERNAL_BUFFERS |
++          VIRGL_RENDERER_CAPSET_NEPTUNE_CAP_DXIL;
+ #endif
+ }
+ 
