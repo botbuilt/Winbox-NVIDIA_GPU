@@ -14,11 +14,122 @@ index b859e3b..2edb580 100644
  #pragma pack(1)
  typedef struct _VIOGPU_RESOURCE_BLOB_OPTIONS
  {
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 7105cc9..57847c9 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -933,7 +933,7 @@ NTSTATUS VioGpuAdapter::QueryDeviceDescriptor(_In_ ULONG ChildUid, _Inout_ DXGK_
+ 
+ // The segment topology shared by DXGKQAITYPE_QUERYSEGMENT3 and 4: segment 1
+ // is the CPU-invisible aperture, optional segment 2 the CPU-visible host
+-// shmem window.
++// shmem window, and (with segment 2) segment 3 the VRAM accounting segment.
+ 
+ // Windows 10 (build 19045 checked) VidMm's InitPagingProcessVaSpace maps the
+ // first paging buffers into the paging process through their segment
+@@ -991,6 +991,33 @@ template <typename DESC> void VioGpuAdapter::FillShmemSegment(DESC *pDesc)
+     pDesc->Flags.CacheCoherent = TRUE;
+     pDesc->Flags.CpuVisible = TRUE;
+     pDesc->Flags.DirectFlip = TRUE;
++    // The shmem window is host RAM, not the GPU's memory: report it as
++    // memory populated from system memory and keep it out of the local
++    // (video memory) budget.  Segment 3 stands for the GPU's memory.
++    pDesc->Flags.PopulatedFromSystemMemory = TRUE;
++    pDesc->Flags.NonLocalBudgetGroup = TRUE;
++}
++
++// Segment 3 stands for the host GPU memory the guest's host-only textures
++// and buffers use.  It is GPU address space only: not CPU-visible (so the
++// video memory manager can never zero or copy it through the CPU, which
++// would trap into QEMU on every access of the unbacked shmem window), and
++// nothing ever reads or writes it; its FILL/TRANSFER paging operations are
++// no-ops.  The UMD places one accounting allocation per large resource here,
++// so Windows' local usage and budget (QueryVideoMemoryInfo, Task Manager's
++// "Dedicated GPU memory") follow what apps really hold on the host GPU, and
++// games trim their texture streaming.  Sized like the shmem window
++// (VRAM_SIZE), the setting that already says how much GPU memory Windows
++// may use.
++template <typename DESC> void VioGpuAdapter::FillAccountSegment(DESC *pDesc)
++{
++    pDesc->BaseAddress.QuadPart = VioGpuAdapter::ACCOUNT_GPU_BASE_VA;
++    pDesc->Size = m_VioDev.shmem.length;
++    pDesc->CommitLimit = m_VioDev.shmem.length;
++    pDesc->Flags.Aperture = FALSE;
++    pDesc->Flags.CacheCoherent = TRUE;
++    pDesc->Flags.CpuVisible = FALSE;
++    pDesc->Flags.LocalBudgetGroup = TRUE;
+ }
+ 
+ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQueryAdapterInfo)
+@@ -1149,16 +1176,17 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 }
+ 
+                 DXGK_QUERYSEGMENTOUT3 *pSegmentInfo = (DXGK_QUERYSEGMENTOUT3 *)pQueryAdapterInfo->pOutputData;
+-                const UINT nbSegments = m_VioDev.shmem.available ? 2 : 1;
++                const UINT nbSegments = m_VioDev.shmem.available ? 3 : 1;
+                 pSegmentInfo->NbSegment = nbSegments;
+                 if (pSegmentInfo->pSegmentDescriptor)
+                 {
+                     RtlZeroMemory(pSegmentInfo->pSegmentDescriptor, sizeof(DXGK_SEGMENTDESCRIPTOR3) * nbSegments);
+                     FillPagingBufferInfo(pSegmentInfo);
+                     FillApertureSegment(&pSegmentInfo->pSegmentDescriptor[0]);
+-                    if (nbSegments == 2)
++                    if (nbSegments == 3)
+                     {
+                         FillShmemSegment(&pSegmentInfo->pSegmentDescriptor[1]);
++                        FillAccountSegment(&pSegmentInfo->pSegmentDescriptor[2]);
+                     }
+                 }
+                 DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s Requested segments\n", __FUNCTION__));
+@@ -1182,7 +1210,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 }
+ 
+                 DXGK_QUERYSEGMENTOUT4 *pSegmentInfo = (DXGK_QUERYSEGMENTOUT4 *)pQueryAdapterInfo->pOutputData;
+-                const UINT nbSegments = m_VioDev.shmem.available ? 2 : 1;
++                const UINT nbSegments = m_VioDev.shmem.available ? 3 : 1;
+ 
+                 // Two-call contract: the first call has NbSegment == 0 (and no
+                 // descriptor array); report only the segment count and touch
+@@ -1212,9 +1240,10 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 }
+                 RtlZeroMemory(pSegmentInfo->pSegmentDescriptor, stride * nbSegments);
+                 FillApertureSegment((DXGK_SEGMENTDESCRIPTOR4 *)pSegmentInfo->pSegmentDescriptor);
+-                if (nbSegments == 2)
++                if (nbSegments == 3)
+                 {
+                     FillShmemSegment((DXGK_SEGMENTDESCRIPTOR4 *)(pSegmentInfo->pSegmentDescriptor + stride));
++                    FillAccountSegment((DXGK_SEGMENTDESCRIPTOR4 *)(pSegmentInfo->pSegmentDescriptor + 2 * stride));
+                 }
+ 
+                 DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s Requested segments (v4)\n", __FUNCTION__));
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index 3bc163f..25a641f 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -109,6 +109,10 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
+     }
+ 
+     static const ULONGLONG SHMEM_GPU_BASE_VA = 0x700000000;
++    // Segment 3: GPU address space only (no CPU view, no backing), where the
++    // UMD's VRAM accounting allocations (VIOGPU_BLOB_FLAG_VRAM_ACCOUNT) live.
++    static const ULONGLONG ACCOUNT_GPU_BASE_VA = 0x1000000000;
++    static const UINT ACCOUNT_SEGMENT_ID = 3;
+   private:
+     DEVICE_OBJECT *m_pPhysicalDevice;
+     DXGKRNL_INTERFACE m_DxgkInterface;
+@@ -217,6 +221,7 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
+     VOID DpcRoutine(VOID);
+     NTSTATUS QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQueryAdapterInfo);
+     template <typename DESC> void FillShmemSegment(DESC *pDesc);
++    template <typename DESC> void FillAccountSegment(DESC *pDesc);
+     NTSTATUS Escape(_In_ CONST DXGKARG_ESCAPE *pEscape);
+     NTSTATUS QueryInterface(_In_ CONST PQUERY_INTERFACE QueryInterface);
+     NTSTATUS StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
 diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
-index b67507d..23d857b 100644
+index b67507d..6791ff0 100644
 --- a/viogpu/viogpu3d/viogpu_allocation.cpp
 +++ b/viogpu/viogpu3d/viogpu_allocation.cpp
-@@ -1206,6 +1206,18 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+@@ -1206,6 +1206,23 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
                  // allocationInfo->Flags.Swizzled = TRUE;
                  allocationInfo->SupportedReadSegmentSet = 0b10;
                  allocationInfo->SupportedWriteSegmentSet = 0b10;
@@ -26,13 +137,18 @@ index b67507d..23d857b 100644
 +                {
 +                    // Stands for a host-only texture or buffer so VidMm
 +                    // counts its size in the process's local usage and
-+                    // budget.  It has no BAR window (never mappable, so
-+                    // ShmemAlloc never places it) and its paging operations
++                    // budget.  It lives in the accounting segment (GPU
++                    // address space only, see FillAccountSegment), has no BAR
++                    // window and no host resource, and its paging operations
 +                    // are no-ops.  Low priority: under pressure VidMm evicts
-+                    // these before any allocation that really lives in the
-+                    // segment.
++                    // these first.  Without a shmem window there is no
++                    // accounting segment and the create fails; the UMD then
++                    // leaves the resource uncounted.
++                    allocationInfo->PreferredSegment.SegmentId0 = VioGpuAdapter::ACCOUNT_SEGMENT_ID;
 +                    allocationInfo->Flags.CpuVisible = FALSE;
 +                    allocationInfo->AllocationPriority = D3DDDI_ALLOCATIONPRIORITY_LOW;
++                    allocationInfo->SupportedReadSegmentSet = 1u << (VioGpuAdapter::ACCOUNT_SEGMENT_ID - 1);
++                    allocationInfo->SupportedWriteSegmentSet = 1u << (VioGpuAdapter::ACCOUNT_SEGMENT_ID - 1);
 +                }
              }
              break;

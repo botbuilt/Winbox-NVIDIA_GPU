@@ -43,11 +43,17 @@ inputs and these changes:
   their texture streaming by that budget kept loading textures as you
   played until the host GPU was full and spilled into host RAM, and Unraid
   killed WinBox. Each large texture or buffer (128 KB or more) now also
-  gets an empty placeholder allocation of the same size in the GPU memory
-  window (`VRAM_SIZE`), so Windows' video memory usage and budget match
-  what the game really has on the GPU, and the game trims itself. The
-  placeholder has no memory behind it. `NPT_VRAM_ACCOUNT=0` (a Windows
-  environment variable) turns it off.
+  gets an empty placeholder allocation of the same size, so Windows' video
+  memory usage and budget match what the game really has on the GPU, and
+  the game trims itself. The placeholders live in a new third memory
+  segment that stands for the GPU's memory: it is as large as the GPU
+  memory window (`VRAM_SIZE`), has no memory behind it and the CPU cannot
+  see it. (A first version put them in the GPU memory window itself;
+  Windows then cleared each one through the CPU, one trapped access at a
+  time, and froze at login.) The GPU memory window is now reported as
+  system memory outside the video memory budget, so "Dedicated GPU memory"
+  in Task Manager is the new segment. `NPT_VRAM_ACCOUNT=0` (a Windows
+  environment variable) turns the placeholders off.
 - [`patches/kmd/0001`](patches/kmd/0001-win10-paging-buffer-segment.patch),
   **Windows 10.** The driver puts its paging buffers in system memory.
   Windows 11 accepts that, but Windows 10's video memory manager
