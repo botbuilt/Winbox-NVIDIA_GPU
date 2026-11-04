@@ -26,7 +26,7 @@ NVIDIA card that **stays shared** with Unraid and your other containers
 | Part | What it does |
 |---|---|
 | Container (`Dockerfile`, `src/`) | [dockurr/windows](https://github.com/dockur/windows) (runs Windows in QEMU/KVM inside the container and installs it automatically) plus an Unraid startup hook that checks the shared GPU setup and explains any missing setting |
-| Host GPU stack (`qemu-triton/`) | QEMU, virglrenderer and DXVK with [Triton](https://blog.getutm.app/2026/introducing-triton-directx-11-driver-for-qemu/) support, built from pinned upstream commits with a few fixes for Nvidia and Linux |
+| Host GPU stack (`qemu-triton/`) | QEMU, virglrenderer, DXVK and vkd3d-proton (Direct3D 12) with [Triton](https://blog.getutm.app/2026/introducing-triton-directx-11-driver-for-qemu/) support, built from pinned upstream commits with a few fixes for Nvidia and Linux |
 | Streaming (`sunshine/`) | [Sunshine](https://github.com/LizardByte/Sunshine) with a capture source that takes Windows' screen straight from QEMU and encodes it with NVENC, for [Moonlight](https://moonlight-stream.org/) |
 | Windows driver (`driver/`) | A GitHub Actions build of the Triton guest driver, test-signed, with fixes for 32-bit games and Remote Desktop |
 | Unraid extras (`unraid/`, `scripts/`) | Community Applications template, backup, snapshot and clean-shutdown User Scripts |
@@ -485,13 +485,15 @@ packages it for Unraid and carries small fixes.
   ([utmapp/qemu](https://github.com/utmapp/qemu),
   [utmapp/virglrenderer](https://github.com/utmapp/virglrenderer),
   [osy/dxvk](https://github.com/osy/dxvk),
+  [osy/vkd3d-proton](https://github.com/osy/vkd3d-proton),
   [osy/virtio-win-mesa](https://github.com/osy/virtio-win-mesa),
   [osy/kvm-guest-drivers-windows](https://github.com/osy/kvm-guest-drivers-windows)).
 - [Sunshine](https://github.com/LizardByte/Sunshine) by LizardByte and
   [Moonlight](https://moonlight-stream.org/): game streaming. The
   container's streaming is Sunshine with one added capture source.
 - [QEMU](https://www.qemu.org/), [virglrenderer](https://gitlab.freedesktop.org/virgl/virglrenderer),
-  [DXVK](https://github.com/doitsujin/dxvk) and [Mesa](https://www.mesa3d.org/).
+  [DXVK](https://github.com/doitsujin/dxvk),
+  [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) and [Mesa](https://www.mesa3d.org/).
 - The [virtio-win](https://github.com/virtio-win/kvm-guest-drivers-windows)
   drivers by Red Hat and contributors.
 
@@ -505,7 +507,7 @@ these patches here.
   (the Sunshine patch in `sunshine/patches` is GPL-3.0, like Sunshine). The
   image and the driver package also contain upstream software under its own
   licenses, among them QEMU (GPL-2.0), Sunshine (GPL-3.0), virglrenderer
-  (MIT), DXVK (zlib), Mesa (MIT and others) and the virtio-win drivers
+  (MIT), DXVK (zlib), vkd3d-proton (LGPL-2.1), Mesa (MIT and others) and the virtio-win drivers
   (BSD-3-Clause). Their sources are the pinned upstream commits named in the
   `Dockerfile` and in `.github/workflows/driver.yml`, plus the patches in
   this repository.
