@@ -1,0 +1,39 @@
+diff --git a/viogpu/shared/viogpum.h b/viogpu/shared/viogpum.h
+index b859e3b..2edb580 100644
+--- a/viogpu/shared/viogpum.h
++++ b/viogpu/shared/viogpum.h
+@@ -369,6 +369,11 @@ typedef struct _VIOGPU_RESOURCE_3D_OPTIONS
+ // inside the D3D12 runtime, which rejects an object owning no allocation with
+ // E_INVALIDARG without ever consulting the driver.
+ #define VIOGPU_BLOB_FLAG_RESIDENCY_ONLY   0x0010
++// With RESIDENCY_ONLY: the blob stands for a host-only D3D11 resource of
++// its Size.  It is placed in the local (host shmem) segment with no CPU
++// access and no backing, so the video memory manager counts that memory in
++// the process's local usage and budget.  Nothing reads or writes it.
++#define VIOGPU_BLOB_FLAG_VRAM_ACCOUNT     0x0020
+ #pragma pack(1)
+ typedef struct _VIOGPU_RESOURCE_BLOB_OPTIONS
+ {
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+index b67507d..23d857b 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -1206,6 +1206,18 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+                 // allocationInfo->Flags.Swizzled = TRUE;
+                 allocationInfo->SupportedReadSegmentSet = 0b10;
+                 allocationInfo->SupportedWriteSegmentSet = 0b10;
++                if (resourceExchange->OptionsBlob.blob_flags & VIOGPU_BLOB_FLAG_VRAM_ACCOUNT)
++                {
++                    // Stands for a host-only texture or buffer so VidMm
++                    // counts its size in the process's local usage and
++                    // budget.  It has no BAR window (never mappable, so
++                    // ShmemAlloc never places it) and its paging operations
++                    // are no-ops.  Low priority: under pressure VidMm evicts
++                    // these before any allocation that really lives in the
++                    // segment.
++                    allocationInfo->Flags.CpuVisible = FALSE;
++                    allocationInfo->AllocationPriority = D3DDDI_ALLOCATIONPRIORITY_LOW;
++                }
+             }
+             break;
+         case VIOGPU_RESOURCE_TYPE_IMPORT:

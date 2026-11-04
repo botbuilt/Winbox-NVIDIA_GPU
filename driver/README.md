@@ -35,6 +35,19 @@ inputs and these changes:
   the host GPU then stayed allocated, so DWM's shared GPU memory and the
   host's video memory grew until the host ran out of RAM. The driver now
   frees it anyway and logs how many such surfaces each process holds open.
+- [`patches/mesa/0005`](patches/mesa/0005-vram-accounting.patch) and
+  [`patches/kmd/0006`](patches/kmd/0006-vram-accounting-allocations.patch),
+  **Games see how much GPU memory they use (test).** Textures and buffers
+  live only on the host GPU, so Windows counted almost none of them and
+  told every game it had used nothing out of its budget. Games that size
+  their texture streaming by that budget kept loading textures as you
+  played until the host GPU was full and spilled into host RAM, and Unraid
+  killed WinBox. Each large texture or buffer (128 KB or more) now also
+  gets an empty placeholder allocation of the same size in the GPU memory
+  window (`VRAM_SIZE`), so Windows' video memory usage and budget match
+  what the game really has on the GPU, and the game trims itself. The
+  placeholder has no memory behind it. `NPT_VRAM_ACCOUNT=0` (a Windows
+  environment variable) turns it off.
 - [`patches/kmd/0001`](patches/kmd/0001-win10-paging-buffer-segment.patch),
   **Windows 10.** The driver puts its paging buffers in system memory.
   Windows 11 accepts that, but Windows 10's video memory manager
