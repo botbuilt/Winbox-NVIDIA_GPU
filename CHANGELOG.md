@@ -17,6 +17,15 @@ First public version, as **WinBox NVIDIA GPU** (`ghcr.io/botbuilt/winbox-nvidia-
   Nvidia's shader cache kept with the Windows disk so games don't recompile
   after an update. The README explains how to size `RAM_SIZE` and the
   memory cap.
+- Direct3D 12 on the host (vkd3d-proton), with DXIL shaders and Windows
+  10's D3D12 driver interface, enough to run OpenGL games on the GPU
+  through Mesa (README: OpenGL games). Shared frames show on NVIDIA cards,
+  and CPU-visible GPU memory is shared without `/dev/udmabuf`.
+- Driver: the two required scheduler registry values are restored at every
+  boot; an optional video memory accounting switch
+  (`VramSegmentMode`, off by default); no deadlock when a program unloads
+  OpenGL; host ring kept awake 8 ms; MSI interrupts.
+- Unraid template ready for Community Applications, with its own icon.
 
 - Windows in a container for Unraid, based on dockurr/windows, with an
   Unraid startup hook, healthcheck, backup, snapshot and clean-shutdown

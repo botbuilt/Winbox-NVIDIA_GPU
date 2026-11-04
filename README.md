@@ -49,8 +49,9 @@ What to expect:
 
 - DirectX 11 (feature level 11_1) for games and apps, a GPU-accelerated
   desktop, browsers and video. 64-bit and 32-bit games.
-- **No DirectX 12** (Triton's DirectX 12 support is still early), no Nvidia
-  driver inside Windows (no CUDA, NVENC or DLSS for Windows programs), and
+- **DirectX 12 is early.** It is good enough to run OpenGL games on the
+  GPU through Mesa (see [OpenGL games](#opengl-games)), but most DirectX 12
+  games won't run yet. No Nvidia driver inside Windows (no CUDA, NVENC or DLSS for Windows programs), and
   the driver needs Windows test mode, which some anti-cheat games refuse.
   CUDA and NVENC are used by the container, for streaming.
 - The desktop feels less snappy than on real hardware, and every program
@@ -92,7 +93,8 @@ What to expect:
 
 ### 2. Install the template
 
-In the Unraid terminal:
+From **Apps** (Community Applications): search for **WinBox** and click
+**Install**. Or, before it is listed there, in the Unraid terminal:
 
 ```bash
 wget -O /boot/config/plugins/dockerMan/templates-user/my-WinBox.xml \
@@ -240,6 +242,30 @@ own. Set either variable in the template to override it.
 Nvidia's compiled shaders are kept in `<storage>/.nvcache` (up to 4 GB), so
 games don't recompile them (and stutter) after the container is updated or
 re-created. Backups and snapshots leave that folder out.
+
+## OpenGL games
+
+Windows has no OpenGL driver for the Triton GPU, so OpenGL games (Ren'Py
+visual novels, Minecraft Java, older indie games) otherwise fall back to a
+slow or leaky path (for example Ren'Py on ANGLE, whose memory keeps
+growing until the server runs out). [Mesa](https://mesa3d.org/)'s OpenGL
+on Direct3D 12 runs them on the GPU instead. It needs driver 58121 or newer.
+In Windows:
+
+1. Download the newest **25.x** `mesa3d-*-release-msvc.7z` from
+   [pal1000/mesa-dist-win](https://github.com/pal1000/mesa-dist-win/releases)
+   (26.x has no desktop OpenGL) and copy `x64\libgallium_wgl.dll` and
+   `x64\dxil.dll` to `C:\Windows\System32`.
+2. In an admin PowerShell, register it as the GPU's OpenGL driver:
+   ```powershell
+   $k=(Get-PnpDeviceProperty -InstanceId (Get-PnpDevice -Class Display | ?{$_.InstanceId -like '*VEN_1AF4*DEV_1050*'}).InstanceId -KeyName DEVPKEY_Device_Driver).Data; $p='HKLM:\SYSTEM\CurrentControlSet\Control\Class\'+$k; Set-ItemProperty $p OpenGLDriverName 'libgallium_wgl.dll'; Set-ItemProperty $p OpenGLVersion 1 -Type DWord; Set-ItemProperty $p OpenGLFlags 1 -Type DWord
+   ```
+3. In an admin Command Prompt: `setx GALLIUM_DRIVER d3d12 /M`, then restart
+   Windows.
+
+Without step 3 Mesa renders on the CPU (llvmpipe), which is slower but also
+works. A game's log should then name `D3D12 (Red Hat VirtIO GPU 3D
+controller)` as its OpenGL renderer.
 
 ## Streaming with Moonlight
 
@@ -494,6 +520,8 @@ packages it for Unraid and carries small fixes.
 - [QEMU](https://www.qemu.org/), [virglrenderer](https://gitlab.freedesktop.org/virgl/virglrenderer),
   [DXVK](https://github.com/doitsujin/dxvk),
   [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) and [Mesa](https://www.mesa3d.org/).
+- [pal1000/mesa-dist-win](https://github.com/pal1000/mesa-dist-win): the
+  Windows builds of Mesa used for [OpenGL games](#opengl-games).
 - The [virtio-win](https://github.com/virtio-win/kvm-guest-drivers-windows)
   drivers by Red Hat and contributors.
 
